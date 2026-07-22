@@ -1,0 +1,22 @@
+# Streamlit configuration for the Takshashila RAG app.
+
+[server]
+# Streamlit's default watcher walks every imported module to enable hot-reload.
+# When it inspects the `transformers` library (pulled in by sentence-transformers),
+# transformers lazily imports its image models, which need `torchvision`. We don't
+# use those (text embeddings only), so those imports raise harmless
+# "No module named 'torchvision'" warnings that flood the terminal.
+# Setting the watcher to "none" stops that scan entirely.
+#   -> side effect: the app no longer auto-reruns when you edit app.py;
+#      just press "R" in the browser, or restart `streamlit run app.py`.
+fileWatcherType = "none"
+
+# Don't auto-open a browser tab on launch (optional; remove if you like it).
+headless = true
+
+[logger]
+# Keep the console quiet: only show real errors, not the watcher's warnings.
+level = "error"
+
+[browser]
+gatherUsageStats = false

@@ -1,0 +1,40 @@
+# Dockerfile.mattermost — container image for the Takshashila Mattermost RAG bot.
+#
+# Build:
+#   docker build -f Dockerfile.mattermost -t takshashila-mm-bot .
+#
+# Run (mount your real .env and the prebuilt FAISS index):
+#   docker run -d --name takshashila-mm-bot \
+#     -p 8000:8000 \
+#     --env-file .env \
+#     -v "$(pwd)/data:/app/data" \
+#     takshashila-mm-bot
+#
+# Notes:
+# * The FAISS index (data/index/faiss.index + metadata) must already be built.
+#   This image does not build the knowledge base; it only serves queries.
+# * The embedding model downloads from Hugging Face on first run unless cached.
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    HF_HUB_DISABLE_SYMLINKS_WARNING=1
+
+WORKDIR /app
+
+# System deps occasionally needed by faiss-cpu / sentence-transformers wheels.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python deps first for better layer caching.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the project (src/, integrations/, scripts/, etc.).
+COPY . .
+
+EXPOSE 8000
+
+CMD ["uvicorn", "integrations.mattermost_bot:app", "--host", "0.0.0.0", "--port", "8000"]

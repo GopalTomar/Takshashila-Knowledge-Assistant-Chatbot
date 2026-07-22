@@ -1,0 +1,39 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+.streamlit/secrets.toml
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Large archives
+*.zip
+*.7z
+*.rar
+
+# Executables
+*.exe
+
+# Local models
+models/
+*.gguf
+
+# Backup files
+*.backup_*
+*.bak
+*.bak_*
+*.backup
+
+# Embedding cache (can be regenerated)
+data/index/embedding_cache.npz
+
+# VS Code
+.vscode/
+
+# Logs
+*.log

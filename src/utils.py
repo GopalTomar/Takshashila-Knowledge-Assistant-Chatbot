@@ -66,6 +66,158 @@ def is_same_domain(url: str, domain: str = "takshashila.org.in") -> bool:
         return False
 
 
+# ── Source-quality predicates (single source of truth) ──────────────────────────
+# Used by BOTH the retriever (so listing/nav pages never consume a top-k slot)
+# and the RAG pipeline (defence in depth), so an answer is always cited to the
+# specific article — never to an aggregate index/landing page whose link would
+# only send the reader to a list.
+
+# Author / tag / category / paginated-archive URLs.
+_NAV_URL_RE = re.compile(
+    r"/(?:author|authors|people|team|staff|profile|tag|tags|category|categories|"
+    r"topic|topics|archive|archives|search|page)/",
+    re.IGNORECASE,
+)
+_NAV_TITLE_RE = re.compile(
+    r"^(?:tag|category|topic|archive|author|search results?)\s*[:\u2013\u2014-]",
+    re.IGNORECASE,
+)
+# "Pranay Kotasthane – Takshashila Institution" — a bare person-name page title.
+_PERSON_TITLE_RE = re.compile(
+    r"^[A-Z][\w.'-]+(?:\s+[A-Z][\w.'-]+){0,3}\s*[\u2013\u2014-]\s*"
+    r"Takshashila(?:\s+Institution)?\s*$"
+)
+# A section/index URL with nothing after the section name (a listing), e.g.
+# /pages/blogs/, /blogs/, /research/ — but NOT /blogs/some-post (an article).
+_LISTING_URL_RE = re.compile(
+    r"/(?:pages/)?(?:publications?|blogs?|articles?|research|commentary|reports?|"
+    r"papers?|briefs?|events?|news|media|content|all[-_]?content|home)/?$",
+    re.IGNORECASE,
+)
+# A title that is *only* a section or the site name (a landing page).
+_GENERIC_TITLE_RE = re.compile(
+    r"^(?:home|homepage|blogs?|publications?|articles?|research|commentary|"
+    r"reports?|papers?|briefs?|events?|news|media|"
+    r"takshashila(?:\s+institution)?)$",
+    re.IGNORECASE,
+)
+
+
+def is_listing_or_landing(url: str = "", title: str = "") -> bool:
+    """True for an aggregate index / section-landing / homepage (not evidence)."""
+    u = (url or "").strip()
+    if u:
+        try:
+            path = urlparse(u).path
+        except Exception:
+            path = u
+        if _LISTING_URL_RE.search((path or "/").rstrip("/") + "/"):
+            return True
+        if path.rstrip("/") in ("", "/index", "/index.html", "/home"):
+            return True
+    t = (title or "").strip()
+    if t and _GENERIC_TITLE_RE.match(t):
+        return True
+    return False
+
+
+def is_low_value_source(url: str = "", title: str = "", text_len: int = 9999,
+                        min_evidence_chars: int = 200) -> bool:
+    """
+    True when a page is navigational / author / listing / landing / too-thin —
+    i.e. it can't serve as the citation for a specific claim. Callers use this to
+    keep such pages out of retrieved evidence so references point to real
+    articles with their exact URLs.
+    """
+    url = (url or "").strip()
+    title = (title or "").strip()
+    if url and _NAV_URL_RE.search(url):
+        return True
+    if title and (_NAV_TITLE_RE.search(title) or _PERSON_TITLE_RE.match(title)):
+        return True
+    if is_listing_or_landing(url, title):
+        return True
+    if text_len < min_evidence_chars:
+        return True
+    return False
+
+
+def chunk_is_low_value(ch: Dict, min_evidence_chars: int = 200) -> bool:
+    """Convenience wrapper of is_low_value_source for a chunk/document dict."""
+    return is_low_value_source(
+        url=(ch.get("url") or ch.get("original_url") or ""),
+        title=(ch.get("title") or ""),
+        text_len=len((ch.get("text") or "").strip()),
+        min_evidence_chars=min_evidence_chars,
+    )
+
+
+def build_meta_header(meta: Dict) -> str:
+    """
+    Build a compact, human-readable metadata header for a chunk/document.
+
+    This header is prepended to the chunk body when embedding and BM25-indexing
+    (via ``chunk_search_text``), so metadata questions — "who wrote this?",
+    "when was it published?", "what are the tags?", "which category?" — become
+    *retrievable* and the answer's supporting chunk actually carries the author,
+    date, section and tags. It is NOT shown to the user (the body is), but the
+    same facts are also surfaced in the LLM context header by the pipeline.
+    """
+    def _fmt_authors(m: Dict) -> str:
+        a = m.get("authors")
+        if isinstance(a, (list, tuple)) and a:
+            return ", ".join(str(x).strip() for x in a if str(x).strip())
+        return str(m.get("author") or "").strip()
+
+    def _fmt_tags(m: Dict) -> str:
+        t = m.get("tags")
+        if isinstance(t, (list, tuple)):
+            return ", ".join(str(x).strip() for x in t if str(x).strip())
+        return str(t or "").strip()
+
+    lines = []
+    title = str(meta.get("title") or "").strip()
+    if title and title.lower() != "untitled":
+        lines.append(f"Title: {title}")
+    if str(meta.get("subtitle") or "").strip():
+        lines.append(f"Subtitle: {meta['subtitle'].strip()}")
+    authors = _fmt_authors(meta)
+    if authors:
+        lines.append(f"Author: {authors}")
+    if str(meta.get("date") or "").strip():
+        lines.append(f"Published: {str(meta['date']).strip()}")
+    if str(meta.get("updated_date") or "").strip():
+        lines.append(f"Updated: {str(meta['updated_date']).strip()}")
+    if str(meta.get("category") or "").strip():
+        lines.append(f"Category: {meta['category'].strip()}")
+    section = str(meta.get("heading_path") or meta.get("section") or "").strip()
+    if section:
+        lines.append(f"Section: {section}")
+    tags = _fmt_tags(meta)
+    if tags:
+        lines.append(f"Tags: {tags}")
+    if str(meta.get("document_type") or "").strip():
+        lines.append(f"Type: {meta['document_type'].strip()}")
+    if str(meta.get("source_name") or "").strip():
+        lines.append(f"Source: {meta['source_name'].strip()}")
+    return "\n".join(lines)
+
+
+def chunk_search_text(ch: Dict) -> str:
+    """
+    The text used for EMBEDDING and BM25 (metadata header + chunk body).
+
+    Prefers a precomputed ``meta_header`` on the chunk; otherwise derives it. The
+    body (``text``) is what gets displayed to the user — the header only makes the
+    metadata searchable so metadata questions resolve to the right document.
+    """
+    header = (ch.get("meta_header") or "").strip()
+    if not header:
+        header = build_meta_header(ch)
+    body = (ch.get("text") or "").strip()
+    return f"{header}\n\n{body}".strip() if header else body
+
+
 def looks_like_pdf(url: str) -> bool:
     return url.lower().split("?")[0].endswith(".pdf")
 
@@ -605,4 +757,45 @@ def with_retry(fn, retries: int = 3, backoff: float = 2.0, logger=None):
             if logger:
                 logger.warning(f"Attempt {attempt} failed: {exc}. Retrying in {wait:.1f}s…")
             time.sleep(wait)
-    raise last_exc
+    raise last_exc 
+
+# ── Clickable citations ─────────────────────────────────────────────────────────
+# The model emits inline markers like "[Source 1]" / "[1]". Once the citation
+# verifier has renumbered them to match the displayed source list, we can turn each
+# marker into a Markdown link straight to that source's URL, so a reader can jump
+# to the exact document a claim came from.
+
+# Not followed by "(" → skip markers that are already Markdown links.
+_CITATION_MARKER_RE = re.compile(r"\[(?:Source\s+)?(\d{1,2})\](?!\()", re.IGNORECASE)
+
+
+def linkify_citations(answer_text: str, sources: list, label: str = "[{n}]") -> str:
+    """
+    Rewrite inline ``[Source N]`` / ``[N]`` markers into Markdown links pointing at
+    ``sources[N-1]``'s URL.
+
+        "…households [Source 2]."  →  "…households [[2]](https://…/lpg)."  (renders as [2])
+
+    A marker whose number has no matching source, or whose source has no URL, is
+    left exactly as-is (never turned into a broken link). Markers already inside a
+    Markdown link are not touched, so calling this twice is safe.
+    """
+    if not answer_text or not sources:
+        return answer_text or ""
+
+    urls = []
+    for s in sources:
+        u = (s.get("url") or s.get("original_url") or "").strip() if isinstance(s, dict) else ""
+        urls.append(u)
+
+    def _sub(m: "re.Match") -> str:
+        idx = int(m.group(1))
+        if not (1 <= idx <= len(urls)) or not urls[idx - 1]:
+            return m.group(0)                      # unknown or URL-less → leave alone
+        start = m.start()
+        # Already part of "[[1]](url)" or "…](" — don't double-wrap.
+        if start > 0 and answer_text[start - 1] == "[":
+            return m.group(0)
+        return f"[{label.format(n=idx)}]({urls[idx - 1]})"
+
+    return _CITATION_MARKER_RE.sub(_sub, answer_text)

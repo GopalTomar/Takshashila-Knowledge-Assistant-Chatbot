@@ -1,13 +1,41 @@
-langchain==0.1.0
-langchain-community==0.0.10
-chromadb==0.4.18
-sentence-transformers==2.2.2
-llama-cpp-python==0.2.20
-PyPDF2==3.0.1
-python-docx==0.8.11
-Pillow==10.1.0
-pytesseract==0.3.10
-pandas==2.1.4
-openpyxl==3.1.2
-rich==13.7.0
-tqdm==4.66.1
+# Streamlit >=1.50 is required for the `width="stretch"` / `width="content"`
+# API that replaces the deprecated `use_container_width` argument.
+streamlit>=1.50,<2.0
+requests
+beautifulsoup4
+lxml
+ftfy
+trafilatura
+feedparser
+python-dotenv
+pandas
+numpy
+faiss-cpu
+sentence-transformers
+groq
+tqdm
+plotly
+rank-bm25
+scikit-learn
+pymupdf
+chardet
+
+# ── Incremental knowledge-base crawler (scripts/) ───────────────────────────────
+# The robust, incremental website + Commit KB crawler
+# (scripts/crawl_engine.py, scripts/update_knowledge_base.py) reuses the packages
+# already listed above — requests, beautifulsoup4, lxml, trafilatura, pymupdf,
+# numpy, faiss-cpu, sentence-transformers.
+#
+# The weekly auto-refresh (scripts/scheduler.py) adds:
+APScheduler>=3.10,<4.0
+# tzdata provides IANA timezone data for zoneinfo on Windows (needed so
+# SCHEDULE_TIMEZONE=Asia/Kolkata resolves); harmless on Linux/macOS.
+tzdata; platform_system == "Windows"
+
+# ── Mattermost bot integration (FastAPI service) ────────────────────────────────
+# These power integrations/mattermost_bot.py and do NOT affect the Streamlit app.
+fastapi
+uvicorn[standard]
+httpx
+python-multipart
+# python-dotenv is already listed above (used by both Streamlit and the bot).
