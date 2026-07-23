@@ -37,3 +37,24 @@ data/index/embedding_cache.npz
 
 # Logs
 *.log
+
+
+# Raw crawl data
+data/raw/
+
+# Runtime logs
+data/logs/
+
+# Archives
+*.zip
+
+# Local executables
+*.exe
+
+# Python
+.venv/
+__pycache__/
+
+# Secrets
+.env
+.streamlit/secrets.toml
