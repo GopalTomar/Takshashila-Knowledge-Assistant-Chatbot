@@ -1,3 +1,5 @@
+> **Historical document.** Superseded by [AUDIT_REPORT.md](AUDIT_REPORT.md) and [IMPLEMENTATION_REPORT.md](IMPLEMENTATION_REPORT.md); some statements below (e.g. `metadata.pkl`, weekly schedule) no longer describe the implementation.
+
 # Takshashila RAG — Production Audit & Upgrade
 
 This pass makes the pipeline answer **content questions and metadata questions**

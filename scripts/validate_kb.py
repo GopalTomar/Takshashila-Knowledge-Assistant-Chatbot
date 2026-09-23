@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """
-validate_kb.py — Health checks for the knowledge base and index.
+validate_kb.py — Health checks for a knowledge-base root (production or staging).
 
-Runs a battery of checks over documents.jsonl, chunks.jsonl and the FAISS
-index, and reports problems grouped by severity:
+Severity:
+  ERROR (critical) — blocks promotion of a new release: empty/missing index,
+      index↔metadata mismatch, duplicate document IDs or URLs, documents without
+      text, chunks missing citation metadata (title + URL/source file), orphan
+      chunks, BM25 unbuildable, a source that disappeared or a large document
+      drop versus the previous release (protects against a broken crawl wiping
+      knowledge), excessive mojibake / OCR garbage.
+  WARN — quality issues worth fixing (missing author/date, chunk size outliers…).
+  INFO — coverage statistics.
 
-  ERROR   — will hurt answers or references (missing URL/title, duplicate URLs,
-            index/metadata count mismatch, empty text, orphan chunks).
-  WARN    — quality issues worth fixing (missing author/date, over/undersized
-            chunks, duplicate chunk hashes, missing embeddings coverage).
-  INFO    — coverage statistics.
-
-Usage:
-    python scripts/validate_kb.py            # human-readable report, exit 1 on ERROR
-    python scripts/validate_kb.py --json     # machine-readable JSON to stdout
+    python scripts/validate_kb.py            # report, exit 1 on ERROR
+    python scripts/validate_kb.py --json     # JSON to stdout
     python scripts/validate_kb.py --strict   # exit 1 on WARN too
 
-It is also importable: ``from scripts.validate_kb import validate`` returns the
-report dict, so the ingestion pipeline can run it automatically after a build.
+``validate(baseline=...)`` takes the previous release's counts for regression checks.
 """
 
 from __future__ import annotations
@@ -27,172 +26,192 @@ import json
 import sys
 from collections import Counter
 from pathlib import Path
+from typing import Dict, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src import config                                   # noqa: E402
-from src.utils import load_jsonl, get_logger, chunk_search_text  # noqa: E402
+from src.utils import (                                  # noqa: E402
+    get_logger, get_text_quality_score, is_true_mojibake_present, load_jsonl,
+)
 
 logger = get_logger("validate_kb", config.SCRAPE_LOG)
 
-# Chunk-size sanity bounds (characters).
-_UNDERSIZE = max(40, config.CHUNK_MIN_LEN)
+_UNDERSIZE = max(20, config.CHUNK_MIN_LEN // 3)
 _OVERSIZE = int(config.CHUNK_SIZE * 2.2)
+MAX_DOC_DROP_RATIO = 0.10      # >10% fewer documents than the previous release = critical
+MAX_MOJIBAKE_RATIO = 0.01      # >1% of chunks with repairable-but-unrepaired mojibake
+MAX_GARBAGE_RATIO = 0.01       # >1% of chunks that are OCR garbage
 
 
-def _load_index_count() -> int:
-    """Number of vectors in the FAISS index (or -1 if unreadable)."""
+def _index_info() -> Dict:
     try:
         import faiss
         if not config.FAISS_INDEX.exists():
-            return -1
-        return int(faiss.read_index(str(config.FAISS_INDEX)).ntotal)
+            return {"ntotal": -1, "dim": 0}
+        idx = faiss.read_index(str(config.FAISS_INDEX))
+        return {"ntotal": int(idx.ntotal), "dim": int(idx.d)}
     except Exception as exc:
         logger.warning(f"Could not read FAISS index: {exc}")
-        return -1
+        return {"ntotal": -1, "dim": 0, "error": str(exc)}
 
 
-def validate() -> dict:
-    """Run all checks and return a structured report dict."""
+def summarize_counts() -> Dict:
+    """Small per-source document counts of the active root (used as a baseline)."""
+    from src.incremental_index import load_all_documents
+    docs = load_all_documents() if config.DOCUMENTS_FILE.exists() else []
+    return {"documents": len(docs), "by_source": dict(Counter(d.get("source", "?") for d in docs))}
+
+
+def validate(baseline: Optional[Dict] = None, check_bm25: bool = True) -> dict:
     errors, warns, infos = [], [], []
+    from src.incremental_index import load_all_documents
+    docs = load_all_documents() if config.DOCUMENTS_FILE.exists() else []
+    chunks = []
+    if config.METADATA_JSON.exists():
+        try:
+            chunks = json.loads(config.METADATA_JSON.read_text(encoding="utf-8"))
+        except Exception as exc:
+            errors.append(f"metadata.json unreadable: {exc}")
+    if not chunks:
+        chunks = load_jsonl(config.CHUNKS_FILE)
 
-    docs = load_jsonl(config.DOCUMENTS_FILE) if config.DOCUMENTS_FILE.exists() else []
-    chunks = load_jsonl(config.CHUNKS_FILE) if config.CHUNKS_FILE.exists() else []
+    # ── Documents ───────────────────────────────────────────────────────────────
+    ids = Counter(d.get("document_id") for d in docs)
+    urls = Counter((d.get("url") or "").strip() for d in docs if (d.get("url") or "").strip())
+    missing_url = [d.get("document_id") for d in docs
+                   if not (d.get("url") or "").strip() and d.get("source") in ("website", "commit_kb")]
+    missing_title = sum(1 for d in docs if not (d.get("title") or "").strip()
+                        or d.get("title", "").strip().lower() == "untitled")
+    empty_text = [d.get("document_id") for d in docs if not (d.get("text") or "").strip()]
+    no_author = sum(1 for d in docs if d.get("content_type") in ("publication", "blog", "op-ed")
+                    and not (d.get("authors") or d.get("author")))
+    no_date = sum(1 for d in docs if d.get("content_type") in ("publication", "blog", "op-ed")
+                  and not (d.get("publication_date") or d.get("date")))
+    by_source = Counter(d.get("source", "?") for d in docs)
+    by_type = Counter(d.get("content_type", "?") for d in docs)
 
-    # ── Documents ─────────────────────────────────────────────────────────────
-    url_counts = Counter()
-    chash_counts = Counter()
-    missing_url = missing_title = missing_author = missing_date = empty_text = 0
-    doc_ids = set()
-
-    for d in docs:
-        did = d.get("document_id") or d.get("id") or ""
-        doc_ids.add(did)
-        url = (d.get("url") or d.get("original_url") or "").strip()
-        if url:
-            url_counts[url] += 1
-        else:
-            missing_url += 1
-        if not (d.get("title") or "").strip() or (d.get("title") or "").strip().lower() == "untitled":
-            missing_title += 1
-        if not (str(d.get("author") or "").strip() or d.get("authors")):
-            missing_author += 1
-        if not str(d.get("date") or "").strip():
-            missing_date += 1
-        if not (d.get("text") or "").strip():
-            empty_text += 1
-        ch = d.get("content_hash")
-        if ch:
-            chash_counts[ch] += 1
-
-    dup_urls = {u: n for u, n in url_counts.items() if n > 1}
-    dup_content = {h: n for h, n in chash_counts.items() if n > 1}
-
-    if docs:
-        infos.append(f"{len(docs)} documents; {len(url_counts)} distinct URLs.")
-    else:
+    if not docs:
         errors.append("No documents found (documents.jsonl empty or missing).")
-    if missing_url:
-        errors.append(f"{missing_url} document(s) missing a URL (cannot be linked as a reference).")
+    else:
+        infos.append(f"{len(docs)} documents; by source {dict(by_source)}; by type {dict(by_type)}")
+    dup_ids = [k for k, n in ids.items() if n > 1]
+    dup_urls = [k for k, n in urls.items() if n > 1]
+    if dup_ids:
+        errors.append(f"{len(dup_ids)} duplicate document ID(s), e.g. {dup_ids[:3]}")
     if dup_urls:
-        errors.append(f"{len(dup_urls)} duplicate document URL(s) (same page stored more than once).")
+        errors.append(f"{len(dup_urls)} duplicate document URL(s), e.g. {dup_urls[:3]}")
+    if missing_url:
+        errors.append(f"{len(missing_url)} crawled document(s) missing a URL, e.g. {missing_url[:3]}")
     if empty_text:
-        errors.append(f"{empty_text} document(s) have empty text.")
+        errors.append(f"{len(empty_text)} document(s) have empty text, e.g. {empty_text[:3]}")
     if missing_title:
         warns.append(f"{missing_title} document(s) missing a meaningful title.")
-    if missing_author:
-        warns.append(f"{missing_author} document(s) missing author metadata "
-                     f"(metadata questions like 'who wrote this' may fail for them).")
-    if missing_date:
-        warns.append(f"{missing_date} document(s) missing a publication date.")
-    if dup_content:
-        warns.append(f"{len(dup_content)} group(s) of documents share identical content "
-                     f"(possible duplicates / canonical collapse needed).")
+    if no_author:
+        warns.append(f"{no_author} publication/blog/op-ed document(s) without an author.")
+    if no_date:
+        warns.append(f"{no_date} publication/blog/op-ed document(s) without a date.")
 
-    # ── Chunks ────────────────────────────────────────────────────────────────
+    # ── Regression guard vs previous release ─────────────────────────────────────
+    if baseline and baseline.get("documents"):
+        prev_n = baseline["documents"]
+        if len(docs) < prev_n * (1 - MAX_DOC_DROP_RATIO):
+            errors.append(f"Document count dropped from {prev_n} to {len(docs)} "
+                          f"(> {MAX_DOC_DROP_RATIO:.0%}) — refusing to promote.")
+        for src, n in (baseline.get("by_source") or {}).items():
+            if n >= 5 and by_source.get(src, 0) == 0:
+                errors.append(f"Source '{src}' had {n} documents and now has none.")
+
+    # ── Chunks ──────────────────────────────────────────────────────────────────
+    doc_ids = set(ids)
     if chunks:
-        chunk_hashes = Counter(c.get("chunk_hash") or c.get("chunk_id") for c in chunks)
-        dup_chunks = sum(n - 1 for n in chunk_hashes.values() if n > 1)
-        undersized = sum(1 for c in chunks if len((c.get("text") or "")) < _UNDERSIZE)
-        oversized = sum(1 for c in chunks if len((c.get("text") or "")) > _OVERSIZE)
-        no_meta_header = sum(1 for c in chunks if not (c.get("meta_header") or "").strip())
-        orphans = sum(1 for c in chunks
-                      if (c.get("document_id") or c.get("doc_id")) not in doc_ids) if doc_ids else 0
-        missing_chunk_title = sum(1 for c in chunks
-                                  if not (c.get("title") or "").strip()
-                                  or (c.get("title") or "").strip().lower() == "untitled")
-
-        infos.append(f"{len(chunks)} chunks; avg "
-                     f"{sum(len(c.get('text') or '') for c in chunks)//max(1,len(chunks))} chars.")
-        if dup_chunks:
-            warns.append(f"{dup_chunks} duplicate chunk(s) by content hash.")
+        chunk_ids = Counter(c.get("chunk_id") for c in chunks)
+        dup_chunk_ids = sum(n - 1 for n in chunk_ids.values() if n > 1)
+        orphans = sum(1 for c in chunks if c.get("document_id") not in doc_ids) if doc_ids else 0
+        no_cite = sum(1 for c in chunks if not (c.get("title") or "").strip()
+                      or not ((c.get("url") or "").strip() or c.get("source_file")))
+        mojibake = sum(1 for c in chunks if is_true_mojibake_present(c.get("text", "")))
+        garbage = sum(1 for c in chunks if get_text_quality_score(c.get("text", "")) < 0.5)
+        undersized = sum(1 for c in chunks if len(c.get("text") or "") < _UNDERSIZE)
+        oversized = sum(1 for c in chunks if len(c.get("text") or "") > _OVERSIZE)
+        n = len(chunks)
+        infos.append(f"{n} chunks; avg {sum(len(c.get('text') or '') for c in chunks)//max(1, n)} chars")
+        if dup_chunk_ids:
+            errors.append(f"{dup_chunk_ids} duplicate chunk ID(s).")
+        if orphans:
+            errors.append(f"{orphans} orphan chunk(s) whose document is not in documents.jsonl.")
+        if no_cite:
+            errors.append(f"{no_cite} chunk(s) lack citation metadata (title + URL/source file).")
+        if mojibake > n * MAX_MOJIBAKE_RATIO:
+            errors.append(f"{mojibake} chunk(s) still contain mojibake.")
+        elif mojibake:
+            warns.append(f"{mojibake} chunk(s) contain mojibake-like sequences.")
+        if garbage > n * MAX_GARBAGE_RATIO:
+            errors.append(f"{garbage} chunk(s) look like OCR garbage.")
         if oversized:
             warns.append(f"{oversized} oversized chunk(s) (> {_OVERSIZE} chars).")
         if undersized:
             warns.append(f"{undersized} undersized chunk(s) (< {_UNDERSIZE} chars).")
-        if orphans:
-            errors.append(f"{orphans} orphan chunk(s) whose document is not in documents.jsonl.")
-        if no_meta_header:
-            warns.append(f"{no_meta_header} chunk(s) missing a metadata header "
-                         f"(rebuild so metadata is searchable).")
-        if missing_chunk_title:
-            warns.append(f"{missing_chunk_title} chunk(s) missing a title.")
     else:
-        warns.append("No chunks found (chunks.jsonl missing) — run a build.")
+        errors.append("No chunks / index metadata found — run a build.")
 
-    # ── Index coverage ────────────────────────────────────────────────────────
-    idx_n = _load_index_count()
-    if idx_n < 0:
+    # ── Index ───────────────────────────────────────────────────────────────────
+    info = _index_info()
+    if info["ntotal"] < 0:
         errors.append("FAISS index missing or unreadable.")
-    elif chunks and idx_n != len(chunks):
-        errors.append(f"Index/metadata mismatch: {idx_n} vectors vs {len(chunks)} chunks "
-                      f"(some chunks have no embedding — rebuild the index).")
+    elif chunks and info["ntotal"] != len(chunks):
+        errors.append(f"Index/metadata mismatch: {info['ntotal']} vectors vs {len(chunks)} chunks.")
     elif chunks:
-        infos.append(f"Index has {idx_n} vectors, matching {len(chunks)} chunks.")
+        infos.append(f"FAISS index: {info['ntotal']} vectors, dim {info['dim']}.")
+    if info.get("dim") and info["dim"] != config.EMBEDDING_DIM:
+        errors.append(f"Index dimension {info['dim']} != embedding model dimension {config.EMBEDDING_DIM}.")
 
-    report = {
+    if check_bm25 and chunks:
+        try:
+            from rank_bm25 import BM25Okapi
+            from src.utils import chunk_search_text
+            from src.vector_store import bm25_tokenize
+            sample = chunks[: min(len(chunks), 2000)]
+            BM25Okapi([bm25_tokenize(chunk_search_text(c)) or ["_"] for c in sample])
+        except Exception as exc:
+            errors.append(f"BM25 index could not be built: {exc}")
+
+    return {
         "ok": not errors,
-        "counts": {"documents": len(docs), "chunks": len(chunks), "index_vectors": idx_n},
+        "root": str(config.KB_ROOT),
+        "counts": {"documents": len(docs), "chunks": len(chunks), "index_vectors": info["ntotal"],
+                   "by_source": dict(by_source), "by_content_type": dict(by_type)},
         "errors": errors, "warnings": warns, "info": infos,
     }
-    return report
 
 
 def _print_report(report: dict) -> None:
-    print("══════════════════════════════════════════════════════════")
-    print(" KNOWLEDGE BASE VALIDATION")
-    print("══════════════════════════════════════════════════════════")
-    c = report["counts"]
-    print(f" documents: {c['documents']}   chunks: {c['chunks']}   "
-          f"index vectors: {c['index_vectors']}")
-    for label, items in (("ERROR", report["errors"]),
-                         ("WARN", report["warnings"]),
-                         ("INFO", report["info"])):
-        for it in items:
-            print(f"  [{label}] {it}")
-    print("──────────────────────────────────────────────────────────")
-    print(" RESULT:", "✅ PASS" if report["ok"] else "❌ FAIL (errors present)")
-    print("══════════════════════════════════════════════════════════")
+    print(f"Knowledge base validation — {'PASS' if report['ok'] else 'FAIL'}  ({report['root']})")
+    for label, key in (("ERROR", "errors"), ("WARN", "warnings"), ("INFO", "info")):
+        for m in report[key]:
+            print(f"  [{label}] {m}")
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Validate the knowledge base and index.")
-    ap.add_argument("--json", action="store_true", help="Emit JSON instead of a report.")
-    ap.add_argument("--strict", action="store_true", help="Exit non-zero on warnings too.")
+    ap = argparse.ArgumentParser(description="Validate the knowledge base.")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--strict", action="store_true")
+    ap.add_argument("--output", help="Also write the JSON report to this path.")
     args = ap.parse_args()
-
     report = validate()
+    if args.output:
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        public = {k: v for k, v in report.items() if k != "root"}      # no local paths in reports
+        public["kb_version"] = Path(report["root"]).name
+        Path(args.output).write_text(json.dumps(public, indent=2, ensure_ascii=False), encoding="utf-8")
     if args.json:
-        print(json.dumps(report, ensure_ascii=False, indent=2))
+        print(json.dumps(report, indent=2, ensure_ascii=False))
     else:
         _print_report(report)
-
-    if report["errors"]:
-        return 1
-    if args.strict and report["warnings"]:
+    if not report["ok"] or (args.strict and report["warnings"]):
         return 1
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

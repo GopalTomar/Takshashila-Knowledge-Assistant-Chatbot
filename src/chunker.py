@@ -113,6 +113,17 @@ def _pack_sentences(
 
 # ── Document → chunks ────────────────────────────────────────────────────────────
 
+# Metadata propagated from the document to every chunk (small fields only — link
+# lists, per-page PDF text and profile work lists stay on the document).
+_PROPAGATE = (
+    "content_type", "categories", "publication_date", "modified_date", "author_urls",
+    "author_url", "source_priority", "parent_url", "is_pdf", "document_series",
+    "document_version", "subcategory", "crawl_date", "role", "research_areas",
+    "source_file", "http_status", "publisher", "is_external_reference",
+)
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
+
+
 def _base_meta(doc: Dict) -> Dict:
     document_id = doc.get("document_id") or doc.get("id") or doc.get("url_hash") or ""
     source      = doc.get("source") or doc.get("source_type") or "local"
@@ -124,90 +135,159 @@ def _base_meta(doc: Dict) -> Dict:
         "source_name":  doc.get("source_name") or config.source_display_name(source, source),
         "title":        doc.get("title", "") or "Untitled",
         "subtitle":     doc.get("subtitle", "") or "",
+        "description":  (doc.get("description", "") or "")[:400],
         "category":     doc.get("category", "") or "",
         "section":      doc.get("section", "") or "",
         "url":          url,
         "canonical_url": doc.get("canonical_url", "") or url,
-        "document_type": doc.get("document_type", "") or "",
+        "document_type": doc.get("document_type", "") or doc.get("content_type", "") or "",
         "language":     doc.get("language", "") or "",
         "page_id":      doc.get("page_id", "") or "",
-        "updated_date": doc.get("updated_date", "") or "",
+        "updated_date": doc.get("updated_date", "") or doc.get("modified_date", "") or "",
         "breadcrumbs":  doc.get("breadcrumbs", []) or [],
         "authors":      authors,
         # ── legacy mirrors ──
         "doc_id":       document_id,
-        "source_type":  source,
+        "source_type":  doc.get("source_type") or source,
         "original_url": url,
         "pdf_url":      doc.get("pdf_url", "") or "",
         "author":       doc.get("author", "") or (authors[0] if authors else ""),
-        "date":         doc.get("date", "") or "",
+        "date":         doc.get("date", "") or doc.get("publication_date", "") or "",
         "tags":         doc.get("tags", []) or [],
     }
-    # Precompute the compact metadata header once per document (shared by all its
-    # chunks) so metadata is searchable and answerable.
+    for k in _PROPAGATE:
+        if doc.get(k) not in (None, "", []):
+            meta[k] = doc[k]
+    # Explicit audience marker (not part of the embedded header): Commit KB content is
+    # internal and must only be served to staff scopes; everything else is public.
+    meta["access"] = "internal" if meta.get("source") == "commit_kb" else "public"
     meta["meta_header"] = build_meta_header(meta)
     return meta
 
 
+def _sections(text: str) -> List[tuple]:
+    """Split Markdown-headed text into (heading_path, body) sections."""
+    sections: List[tuple] = []
+    stack: List[tuple] = []          # (level, heading)
+    buf: List[str] = []
+
+    def flush():
+        body = "\n".join(buf).strip()
+        if body:
+            sections.append((" > ".join(h for _, h in stack), body))
+        buf.clear()
+
+    for line in text.split("\n"):
+        m = _HEADING_RE.match(line.strip())
+        if m:
+            flush()
+            level, heading = len(m.group(1)), m.group(2).strip()
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            stack.append((level, heading))
+            continue
+        buf.append(line)
+    flush()
+    return sections or [("", text)]
+
+
+def _make_chunk(base: Dict, chunk_id: str, idx: int, text: str, heading: str,
+                page_number=None) -> Dict:
+    ch = {**base, "chunk_id": chunk_id, "chunk_index": idx, "chunk_order": idx,
+          "heading_path": heading or base.get("section") or "",
+          "page_number": page_number, "text": text}
+    ch["chunk_hash"] = content_hash(chunk_search_text(ch))
+    return ch
+
+
 def chunk_document(doc: Dict) -> List[Dict]:
-    """Chunk a single (unified) document into metadata-rich chunk dicts."""
+    """Chunk one unified document into metadata-rich, section-aware chunks."""
     doc  = clean_document_metadata(doc)   # repair mojibake before splitting
     base = _base_meta(doc)
     chunks: List[Dict] = []
+    max_chars, overlap_chars, min_len = config.CHUNK_SIZE, config.CHUNK_OVERLAP, config.CHUNK_MIN_LEN
+    # Short-by-nature evidence (op-ed references, holidays) must not be dropped.
+    if doc.get("content_type") in ("op-ed", "holiday", "event", "person"):
+        min_len = min(min_len, 20)
 
-    max_chars     = config.CHUNK_SIZE
-    overlap_chars = config.CHUNK_OVERLAP
-    min_len       = config.CHUNK_MIN_LEN
-
-    # PDF documents may carry per-page text — chunk per page, tagging page_number.
-    if doc.get("source_type") == "pdf" and doc.get("pdf_pages"):
+    if doc.get("pdf_pages"):
+        idx = 0
         for page_info in doc["pdf_pages"]:
-            page_text = clean_mojibake_text(page_info.get("text", ""))
-            page_text, _ = clean_or_drop_bad_lines(page_text)  # remove OCR garbage lines
-            page_num  = page_info.get("page_number", 0)
+            page_text, _ = clean_or_drop_bad_lines(clean_mojibake_text(page_info.get("text", "")))
+            page_num = page_info.get("page_number", 0)
             if not page_text:
                 continue
-            sents = _split_sentences(page_text)
-            for idx, ctext in enumerate(_pack_sentences(sents, max_chars, overlap_chars, min_len)):
+            for ctext in _pack_sentences(_split_sentences(page_text), max_chars, overlap_chars, min_len):
                 if get_text_quality_score(ctext) < CHUNK_QUALITY_MIN:
-                    continue  # skip unrecoverable garbage chunk
-                ch = {
-                    **base,
-                    "chunk_id":    f"{base['document_id']}_p{page_num}_c{idx}",
-                    "chunk_index": idx,
-                    "chunk_order": idx,
-                    "heading_path": base.get("section") or base.get("title") or "",
-                    "page_number": page_num,
-                    "text":        ctext,
-                }
-                ch["chunk_hash"] = content_hash(chunk_search_text(ch))
-                chunks.append(ch)
+                    continue
+                chunks.append(_make_chunk(base, f"{base['document_id']}_p{page_num}_c{idx}",
+                                          idx, ctext, "", page_num))
+                idx += 1
         return chunks
 
-    text = clean_text(doc.get("text", ""))
-    text, _ = clean_or_drop_bad_lines(text)   # remove OCR garbage lines
+    text, _ = clean_or_drop_bad_lines(clean_text(doc.get("text", "")))
     if not text:
         return []
-    sents = _split_sentences(text)
-    for idx, ctext in enumerate(_pack_sentences(sents, max_chars, overlap_chars, min_len)):
-        if get_text_quality_score(ctext) < CHUNK_QUALITY_MIN:
-            continue  # skip unrecoverable garbage chunk
-        ch = {
-            **base,
-            "chunk_id":    f"{base['document_id']}_c{idx}",
-            "chunk_index": idx,
-            "chunk_order": idx,
-            "heading_path": base.get("section") or base.get("title") or "",
-            "page_number": None,
-            "text":        ctext,
-        }
-        ch["chunk_hash"] = content_hash(chunk_search_text(ch))
-        chunks.append(ch)
+    idx = 0
+    for heading, body in _sections(text):
+        for ctext in _pack_sentences(_split_sentences(body), max_chars, overlap_chars, min_len):
+            if get_text_quality_score(ctext) < CHUNK_QUALITY_MIN:
+                continue
+            chunks.append(_make_chunk(base, f"{base['document_id']}_c{idx}", idx, ctext, heading))
+            idx += 1
     return chunks
 
 
+# ── Cross-document boilerplate ───────────────────────────────────────────────────
+# Template text repeated across many documents (e.g. the "The Takshashila Institution
+# is an independent centre for research…" paragraph at the end of every PDF) floods
+# generic questions with near-identical chunks from unrelated documents. Lines that
+# appear in at least BOILERPLATE_MIN_DOCS different documents are removed before
+# chunking, except in content types where that text is the actual subject.
+BOILERPLATE_MIN_DOCS = 12
+BOILERPLATE_MIN_CHARS = 40
+_BOILERPLATE_KEEP_TYPES = ("about", "people_index", "person", "holiday", "op-ed")
+
+
+def _norm_line(line: str) -> str:
+    return re.sub(r"\s+", " ", line).strip().lower()
+
+
+def _doc_lines(doc: Dict) -> List[str]:
+    texts = [p.get("text", "") for p in doc.get("pdf_pages") or []] or [doc.get("text", "")]
+    return [ln for t in texts for ln in (t or "").split("\n")]
+
+
+def find_boilerplate(docs: List[Dict]) -> set:
+    counts: Dict[str, int] = {}
+    for d in docs:
+        for ln in {_norm_line(x) for x in _doc_lines(d)}:
+            if len(ln) >= BOILERPLATE_MIN_CHARS:
+                counts[ln] = counts.get(ln, 0) + 1
+    return {ln for ln, n in counts.items() if n >= BOILERPLATE_MIN_DOCS}
+
+
+def strip_boilerplate(doc: Dict, boilerplate: set) -> Dict:
+    if not boilerplate or doc.get("content_type") in _BOILERPLATE_KEEP_TYPES:
+        return doc
+
+    def clean(t: str) -> str:
+        return "\n".join(ln for ln in (t or "").split("\n") if _norm_line(ln) not in boilerplate)
+
+    out = dict(doc)
+    out["text"] = clean(doc.get("text", ""))
+    if doc.get("pdf_pages"):
+        out["pdf_pages"] = [{**p, "text": clean(p.get("text", ""))} for p in doc["pdf_pages"]]
+    return out
+
+
 def chunk_documents(docs: List[Dict], progress_cb=None) -> List[Dict]:
-    """Chunk a list of unified documents, deduplicating by chunk content hash."""
+    """Chunk documents (cross-document boilerplate removed), deduplicating by content hash."""
+    boilerplate = find_boilerplate(docs) if len(docs) >= BOILERPLATE_MIN_DOCS else set()
+    if boilerplate:
+        logger.info(f"Removing {len(boilerplate)} boilerplate line(s) repeated across "
+                    f"≥{BOILERPLATE_MIN_DOCS} documents")
+        docs = [strip_boilerplate(d, boilerplate) for d in docs]
     all_chunks: List[Dict] = []
     seen = set()
     for i, doc in enumerate(docs):

@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Takshashila Knowledge Assistant</title>
+  <meta name="description" content="Ask questions about Takshashila Institution's research, publications, people and programmes — answers cite their sources.">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src *; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <link rel="icon" href="assets/favicon-192.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Lora:wght@600;700&display=swap">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap header-row">
+      <a class="brand" href="https://takshashila.org.in/" rel="noopener" aria-label="Takshashila Institution">
+        <img src="assets/logo-dark.svg" alt="Takshashila Institution" width="148" height="60">
+      </a>
+      <nav class="nav" aria-label="Primary">
+        <a href="#ask" class="active">Ask</a>
+        <a href="#about">About</a>
+        <button type="button" id="access-btn" class="linklike" aria-haspopup="dialog">Staff access</button>
+      </nav>
+    </div>
+  </header>
+
+  <main id="ask">
+    <section class="hero">
+      <div class="wrap">
+        <p class="eyebrow">Knowledge Assistant</p>
+        <h1>Ask Takshashila</h1>
+        <p class="lede">Answers drawn only from Takshashila's publications, blogs, op-eds, team profiles and programmes — every claim linked to its source.</p>
+
+        <form id="ask-form" class="ask" autocomplete="off">
+          <label for="q" class="sr-only">Your question</label>
+          <textarea id="q" name="q" rows="2" maxlength="1000" required
+                    placeholder="e.g. What has Takshashila published about geospatial technology?"></textarea>
+          <div class="ask-row">
+            <div class="modes" role="radiogroup" aria-label="Answer length">
+              <label><input type="radio" name="mode" value="short"> Short</label>
+              <label><input type="radio" name="mode" value="normal" checked> Normal</label>
+              <label><input type="radio" name="mode" value="detailed"> Detailed</label>
+              <label><input type="radio" name="mode" value="search"> Find documents</label>
+            </div>
+            <button type="submit" id="ask-btn" class="primary">Ask</button>
+          </div>
+        </form>
+        <div id="scope-note" class="scope-note" aria-live="polite"></div>
+        <div class="examples" id="examples" aria-label="Example questions"></div>
+      </div>
+    </section>
+
+    <section class="wrap results" aria-live="polite">
+      <div id="status" class="status" hidden></div>
+      <article id="answer" class="answer" hidden>
+        <div class="answer-head">
+          <h2>Answer</h2>
+          <span id="confidence" class="badge"></span>
+        </div>
+        <div id="answer-body" class="answer-body"></div>
+        <p id="answer-meta" class="answer-meta"></p>
+      </article>
+      <section id="sources" class="sources" hidden>
+        <h2>Sources</h2>
+        <ol id="source-list" class="source-list"></ol>
+      </section>
+    </section>
+  </main>
+
+  <section id="about" class="wrap about">
+    <h2>About this assistant</h2>
+    <div class="about-grid">
+      <div>
+        <h3>What it knows</h3>
+        <p>The public Takshashila website — publications, blogs, op-eds listed under “In the news”, team profiles, research areas, courses and programmes — refreshed automatically every day at 06:00 IST. Staff with an access token can also query the internal Commit knowledge base.</p>
+      </div>
+      <div>
+        <h3>How answers are checked</h3>
+        <p>Answers are generated only from retrieved passages. Every citation is verified against the passage it points to; unsupported citations are removed, and when the evidence is insufficient the assistant says so instead of guessing.</p>
+      </div>
+      <div>
+        <h3>Tips</h3>
+        <ul>
+          <li>Name a person to find their work: “What has Pranay Kotasthane written on semiconductors?”</li>
+          <li>Use a title to find a specific publication.</li>
+          <li>Choose <em>Find documents</em> to list matching documents without an AI answer.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <footer class="site-footer">
+    <div class="wrap footer-row">
+      <span>© Takshashila Institution</span>
+      <span id="api-state" class="api-state">Checking service…</span>
+    </div>
+  </footer>
+
+  <dialog id="access-dialog" aria-labelledby="access-title">
+    <form method="dialog" id="access-form">
+      <h2 id="access-title">Staff access</h2>
+      <p>Enter your access token to include the internal Commit knowledge base. It is kept only in this browser tab (session storage) and sent only to the assistant's API.</p>
+      <label for="token">Access token</label>
+      <input id="token" type="password" autocomplete="off" spellcheck="false">
+      <div class="dialog-row">
+        <button value="clear" type="submit" class="secondary">Remove token</button>
+        <button value="save" type="submit" class="primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

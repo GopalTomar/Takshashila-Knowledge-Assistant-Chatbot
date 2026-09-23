@@ -16,7 +16,6 @@ import json
 import threading
 import time
 from pathlib import Path
-from typing import Optional
 
 try:
     from src import config as _config

@@ -112,7 +112,7 @@ def test_finalize_fallback_when_patch_fails():
 
 
 def test_start_returns_false_when_post_fails():
-    with Recorder(first_post_id=None) as rec:
+    with Recorder(first_post_id=None):
         ind = bot._ProgressIndicator("chan1", STAGES)
         assert ind.start() is False              # no status post → caller skips streaming
 

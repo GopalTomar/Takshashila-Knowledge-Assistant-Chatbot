@@ -1,0 +1,41 @@
+{
+  "generated_at": "2026-09-23T21:14:24Z",
+  "urls_total": 1641,
+  "pages": 1240,
+  "pdfs": 401,
+  "status_counts": {
+    "304": 1388,
+    "404": 244,
+    "None": 9
+  },
+  "outcomes": {
+    "not_modified": 1388,
+    "gone": 244,
+    "None": 9
+  },
+  "by_content_type": {},
+  "broken_internal": 244,
+  "broken_link_rows": 519,
+  "broken_by_status": {
+    "404": 519
+  },
+  "timeouts": 0,
+  "dns_failures": 0,
+  "redirects": 0,
+  "redirect_loops": 0,
+  "multi_hop_redirects": 0,
+  "orphan_pages": 0,
+  "sitemap_only_pages": 0,
+  "links_only_pages": 226,
+  "no_text_pages": 0,
+  "short_text_pages": 0,
+  "missing_title": 0,
+  "articles_missing_author": 0,
+  "articles_missing_date": 0,
+  "duplicate_content_groups": 0,
+  "duplicate_title_groups": 0,
+  "failed_fetches": 0,
+  "external_links_checked": 0,
+  "duplicate_content_examples": [],
+  "duplicate_title_examples": []
+}

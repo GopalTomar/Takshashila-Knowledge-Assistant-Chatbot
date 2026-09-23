@@ -44,7 +44,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -119,7 +119,7 @@ def do_update(incremental: bool = True) -> dict:
             "ok": True,
             "state": "success",
             "kind": kind,
-            "started_at": datetime.utcfromtimestamp(started).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "started_at": datetime.fromtimestamp(started, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "finished_at": now_iso(),
             "duration_seconds": round(time.time() - started, 1),
             "summary": summary,
@@ -146,23 +146,19 @@ def _make_scheduler():
     from apscheduler.schedulers.blocking import BlockingScheduler
     from apscheduler.triggers.cron import CronTrigger
 
-    try:
-        # zoneinfo needs the 'tzdata' package on Windows (see requirements.txt).
-        from zoneinfo import ZoneInfo
-        tz = ZoneInfo(config.SCHEDULE_TIMEZONE)
-    except Exception as exc:
-        logger.warning(f"Timezone '{config.SCHEDULE_TIMEZONE}' unavailable "
-                       f"({exc}); falling back to system local time.")
-        tz = None
+    # zoneinfo needs the 'tzdata' package on Windows (see requirements.txt). Never
+    # fall back to the machine's local time: 06:00 must mean 06:00 Asia/Kolkata.
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(config.SCHEDULE_TIMEZONE)
 
-    scheduler = BlockingScheduler(timezone=tz) if tz else BlockingScheduler()
+    scheduler = BlockingScheduler(timezone=tz)
     trigger = CronTrigger(
         day_of_week=config.SCHEDULE_DAY,
         hour=config.SCHEDULE_HOUR,
         minute=config.SCHEDULE_MINUTE,
         timezone=tz,
     )
-    scheduler.add_job(do_update, trigger, id="weekly_kb_update",
+    scheduler.add_job(do_update, trigger, id="daily_kb_update",
                       max_instances=1, coalesce=True, misfire_grace_time=3600)
     return scheduler, trigger
 

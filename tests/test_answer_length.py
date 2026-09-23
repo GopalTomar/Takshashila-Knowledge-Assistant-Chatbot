@@ -105,7 +105,7 @@ def test_no_handwritten_sources_list_requested():
     _, cap = _run(length="normal")
     # The model must NOT be told to emit its own numbered Sources list.
     assert "numbered list: Title" not in cap.system_prompt
-    assert "shows the source list automatically" in cap.system_prompt
+    assert "shows the verified source list automatically" in cap.system_prompt
 
 def test_default_is_normal():
     _, cap = _run()

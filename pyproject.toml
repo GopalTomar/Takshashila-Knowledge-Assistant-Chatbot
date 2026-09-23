@@ -1,0 +1,17 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 120
+extend-exclude = [".venv", "frontend/dist"]
+
+[tool.ruff.lint]
+# Error-level checks: syntax errors, undefined names, unused imports/variables.
+select = ["E9", "F"]
+ignore = ["F541"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]
+"app.py" = ["F401", "F841"]

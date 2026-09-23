@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from integrations.command_parser import Destination                      # noqa: E402
-from integrations.destination_handlers import base, group_handler        # noqa: E402
+from integrations.destination_handlers import group_handler        # noqa: E402
 from integrations.destination_handlers.base import Requester, ResponsePayload  # noqa: E402
 from integrations import mattermost_api                                   # noqa: E402
 
@@ -34,7 +34,8 @@ class FakeState:
     """Installs configurable fakes onto mattermost_api + group_handler.deliver."""
 
     def __init__(self, *, members=None, create_ok=True, deliver_id="post1",
-                 users=None, show_ok=2):
+                 users=None, show_ok=2, roles=None):
+        self.roles = roles or {}
         self.users = users if users is not None else USERS
         self.create_ok = create_ok
         self.deliver_id = deliver_id
@@ -58,7 +59,8 @@ class FakeState:
         m.is_configured = lambda: True
         m.get_bot_user_id = lambda: BOT_ID
         m.find_user_by_username = lambda name: (
-            {"id": self.users[name], "username": name} if name in self.users else None
+            {"id": self.users[name], "username": name, "roles": self.roles.get(name, "system_user")}
+            if name in self.users else None
         )
 
         def _create(member_ids):
@@ -158,14 +160,14 @@ def test_bot_and_duplicates_are_ignored():
 def test_too_many_users_errors():
     users = {f"u{i}": f"id{i}" for i in range(8)}
     dest = Destination("group", usernames=tuple(users))
-    with FakeState(users=users) as st:
+    with FakeState(users=users):
         result = group_handler.send_to_group_dm(dest, PAYLOAD, REQUESTER)
     assert result.ok is False
     assert "at most" in result.error.lower()
 
 def test_no_usernames_errors():
     dest = Destination("group", usernames=())
-    with FakeState() as st:
+    with FakeState():
         result = group_handler.send_to_group_dm(dest, PAYLOAD, REQUESTER)
     assert result.ok is False
 
@@ -178,3 +180,11 @@ if __name__ == "__main__":
             getattr(mod, name)()
             passed += 1
     print(f"OK — {passed} tests passed")
+
+def test_group_refuses_guest_recipient():
+    with FakeState(roles={"nithiya": "system_guest"}) as st:
+        result = group_handler.send_to_group_dm(
+            Destination(kind="group", usernames=("lakshmi", "nithiya")), PAYLOAD, REQUESTER)
+    assert result.ok is False
+    assert "guest" in result.error
+    assert st.posted_channel is None

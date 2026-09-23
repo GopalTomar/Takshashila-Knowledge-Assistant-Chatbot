@@ -7,7 +7,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
@@ -72,21 +72,20 @@ def is_same_domain(url: str, domain: str = "takshashila.org.in") -> bool:
 # specific article — never to an aggregate index/landing page whose link would
 # only send the reader to a list.
 
-# Author / tag / category / paginated-archive URLs.
+# Author / tag / category / paginated-archive URLs. Team pages are NOT navigation:
+# a profile (/content/team/<name>.html) carries role, bio, research areas and works,
+# and the team index lists who does what — both are evidence.
 _NAV_URL_RE = re.compile(
-    r"/(?:author|authors|people|team|staff|profile|tag|tags|category|categories|"
-    r"topic|topics|archive|archives|search|page)/",
+    r"/(?:author|authors|tag|tags|category|categories|topic|topics|archive|archives|"
+    r"search|page)/",
     re.IGNORECASE,
 )
 _NAV_TITLE_RE = re.compile(
-    r"^(?:tag|category|topic|archive|author|search results?)\s*[:\u2013\u2014-]",
+    r"^(?:tag|category|topic|archive|author|search results?)\s*[:–—-]",
     re.IGNORECASE,
 )
-# "Pranay Kotasthane – Takshashila Institution" — a bare person-name page title.
-_PERSON_TITLE_RE = re.compile(
-    r"^[A-Z][\w.'-]+(?:\s+[A-Z][\w.'-]+){0,3}\s*[\u2013\u2014-]\s*"
-    r"Takshashila(?:\s+Institution)?\s*$"
-)
+# Content types that are short by nature but are genuine evidence.
+_SHORT_EVIDENCE_TYPES = ("person", "op-ed", "holiday", "event")
 # A section/index URL with nothing after the section name (a listing), e.g.
 # /pages/blogs/, /blogs/, /research/ — but NOT /blogs/some-post (an article).
 _LISTING_URL_RE = re.compile(
@@ -131,9 +130,14 @@ def is_low_value_source(url: str = "", title: str = "", text_len: int = 9999,
     """
     url = (url or "").strip()
     title = (title or "").strip()
-    if url and _NAV_URL_RE.search(url):
-        return True
-    if title and (_NAV_TITLE_RE.search(title) or _PERSON_TITLE_RE.match(title)):
+    if url:
+        try:
+            path = urlparse(url).path or "/"
+        except Exception:
+            path = url
+        if _NAV_URL_RE.search(path):
+            return True
+    if title and _NAV_TITLE_RE.search(title):
         return True
     if is_listing_or_landing(url, title):
         return True
@@ -142,12 +146,15 @@ def is_low_value_source(url: str = "", title: str = "", text_len: int = 9999,
     return False
 
 
-def chunk_is_low_value(ch: Dict, min_evidence_chars: int = 200) -> bool:
+def chunk_is_low_value(ch: Dict, min_evidence_chars: int = 40) -> bool:
     """Convenience wrapper of is_low_value_source for a chunk/document dict."""
+    if (ch.get("content_type") or "") == "listing":
+        return True                              # index pages list titles; never evidence
+    short_ok = (ch.get("content_type") or "") in _SHORT_EVIDENCE_TYPES
     return is_low_value_source(
         url=(ch.get("url") or ch.get("original_url") or ""),
         title=(ch.get("title") or ""),
-        text_len=len((ch.get("text") or "").strip()),
+        text_len=9999 if short_ok else len((ch.get("text") or "").strip()),
         min_evidence_chars=min_evidence_chars,
     )
 
@@ -253,8 +260,7 @@ def clean_text(text: str) -> str:
 _FIX_MAP = {
     # ── smart punctuation (UTF-8 read as cp1252) ──
     "â€™": "\u2019", "â€˜": "\u2018", "â€œ": "\u201c", "â€\x9d": "\u201d",
-    "â€”": "\u2014", "â€“": "\u2013", "â€¦": "\u2026", "â€¢": "\u2022",
-    "â€\u009d": "\u201d", "â€?": "\u2019", "â€": "\u201d",
+    "â€”": "\u2014", "â€“": "\u2013", "â€¦": "\u2026", "â€¢": "\u2022", "â€?": "\u2019", "â€": "\u201d",
     # ── smart punctuation (UTF-8 3-byte E2 80 xx read as Latin-1 → â + C1 byte) ──
     # e.g. the em dash "—" becomes "â\x80\x94". These forms use raw C1 control
     # bytes (\x80–\x9f) rather than the cp1252 printable glyphs above, so they
@@ -651,7 +657,7 @@ def parse_date(raw: str) -> str:
 
 
 def now_iso() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ── JSONL helpers ──────────────────────────────────────────────────────────────
@@ -799,3 +805,22 @@ def linkify_citations(answer_text: str, sources: list, label: str = "[{n}]") -> 
         return f"[{label.format(n=idx)}]({urls[idx - 1]})"
 
     return _CITATION_MARKER_RE.sub(_sub, answer_text)
+
+def force_rmtree(path) -> bool:
+    """
+    Remove a directory tree, clearing read-only attributes on the way (Windows /
+    OneDrive-synced folders mark files and directories read-only). Returns True
+    when the tree is gone.
+    """
+    import os
+    import shutil
+    import stat
+
+    def _retry(func, p, _exc):
+        try:
+            os.chmod(p, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+            func(p)
+        except OSError:
+            pass
+    shutil.rmtree(path, onerror=_retry)
+    return not os.path.exists(path)

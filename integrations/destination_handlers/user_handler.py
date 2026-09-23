@@ -34,6 +34,10 @@ def send_to_user_dm(destination: Destination, payload: ResponsePayload,
     if not user or not user.get("id"):
         return DeliveryResult(False, error=f'User "{username}" not found.')
 
+    from integrations import mattermost_bot as _bot
+    if _bot.BLOCK_GUESTS and mattermost_api.recipient_is_guest(user):
+        return DeliveryResult(False, error=f"@{username} is a guest account; internal answers can't be shared with guests.")
+
     dm_channel = mattermost_api.get_or_create_dm_channel(user["id"])
     if not dm_channel:
         return DeliveryResult(False, error=f'I couldn\'t open a direct message with @{username}.')

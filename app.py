@@ -19,7 +19,8 @@ Loading / caching:
 Every backend call is guarded so a missing file never crashes the UI.
 """
 
-import sys, time, re, json, threading
+import sys, time, re, json, threading, hmac
+import html as _html
 from pathlib import Path
 from string import Template
 from datetime import datetime, timedelta
@@ -481,6 +482,16 @@ def low_confidence_warning(level):
         st.info("ℹ️ No sufficiently relevant evidence was found in the knowledge base for this question.")
 
 
+def _esc(v) -> str:
+    """HTML-escape crawled text before it goes into unsafe_allow_html markup."""
+    return _html.escape(str(v or ""), quote=True)
+
+
+def _safe_href(u) -> str:
+    u = str(u or "").strip()
+    return _esc(u) if u.lower().startswith(("http://", "https://")) else ""
+
+
 def rich_source_card(ch, index):
     title    = clean_mojibake_text(ch.get("title", "Untitled")) or "Untitled"
     source   = (ch.get("source") or ch.get("source_type") or "").lower()
@@ -498,6 +509,11 @@ def rich_source_card(ch, index):
     score    = ch.get("score", ch.get("rrf_score", 0)) or 0
     tc       = src_colour(source)
     score_pct = f"{score*100:.1f}%" if score else "—"
+    # Everything below is interpolated into HTML: escape all crawled values.
+    title, src_name, category, author, section, doctype = (
+        _esc(title), _esc(src_name), _esc(category), _esc(author), _esc(section), _esc(doctype))
+    date, updated, url = _esc(date), _esc(updated), _safe_href(url)
+    tags = [_esc(t) for t in tags]
 
     def chip(txt, bg, fg):
         return (f"<span style='background:{bg};color:{fg};font-size:0.62rem;font-weight:700;padding:2px 9px;"
@@ -549,7 +565,7 @@ def rich_source_card(ch, index):
           </div>
           <div style="margin-top:10px;padding-top:10px;border-top:1px solid {BORDER};font-size:0.81rem;
                       color:{MUTED};font-style:italic;line-height:1.65;font-family:Inter,sans-serif">
-            {truncate(clean_mojibake_text(ch.get('text','')), 300)}</div>
+            {_esc(truncate(clean_mojibake_text(ch.get('text','')), 300))}</div>
           {tag_html}
           <div style="margin-top:10px">{link_html}</div>
         </div>""", unsafe_allow_html=True)
@@ -780,8 +796,19 @@ with st.sidebar:
         _clear_all_caches(); st.rerun()
 
 
+# Admin (Build & Update / Automation) is hidden unless ADMIN_PASSWORD is set and
+# entered in the sidebar. Public users only see Home / Ask / Explorer / Analytics.
+with st.sidebar:
+    IS_ADMIN = False
+    if config.ADMIN_PASSWORD:
+        with st.expander("🔐 Admin", expanded=False):
+            _pw = st.text_input("Admin password", type="password", key="admin_pw")
+            IS_ADMIN = bool(_pw) and hmac.compare_digest(_pw.encode(), config.ADMIN_PASSWORD.encode())
+            if _pw and not IS_ADMIN:
+                st.error("Incorrect password.")
+
 tabs = st.tabs(["🏠  Home", "💬  Ask Takshashila", "📚  Document Explorer",
-                "📊  Analytics", "🛠️  Build & Update", "🗓️  Automation"])
+                "📊  Analytics"] + (["🛠️  Build & Update", "🗓️  Automation"] if IS_ADMIN else []))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1130,7 +1157,7 @@ with tabs[1]:
 
                 if "error" in holder:
                     status.update(label="Something went wrong.", state="error")
-                    assistant_msg = {"role": "assistant", "content": f"⚠️ Error after {elapsed:.1f}s: {holder['error']}",
+                    assistant_msg = {"role": "assistant", "content": f"⚠️ Sorry — the answer could not be generated ({type(holder['error']).__name__}). Please try again.",
                                      "query": user_query, "sources": [], "confidence": "none", "elapsed_time": elapsed,
                                      "model": model_choice, "timestamp": now_iso(), "is_error": True, "grounded": False}
                 else:
@@ -1430,103 +1457,104 @@ with tabs[3]:
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 5 — BUILD & UPDATE
 # ════════════════════════════════════════════════════════════════════════════
-with tabs[4]:
-    st.markdown(f"""<div style="margin-bottom:16px">
-      <h2 style="margin:0 0 5px">Build & Update Knowledge Base</h2>
-      <p style="color:{MUTED};font-family:Inter,sans-serif;font-size:0.88rem;margin:0">
-        Crawl the website + Commit KB, merge, chunk, embed, index and validate — with live logs.
-        Incremental runs re-embed only changed chunks.</p></div>""", unsafe_allow_html=True)
+if IS_ADMIN:
+    with tabs[4]:
+        st.markdown(f"""<div style="margin-bottom:16px">
+          <h2 style="margin:0 0 5px">Build & Update Knowledge Base</h2>
+          <p style="color:{MUTED};font-family:Inter,sans-serif;font-size:0.88rem;margin:0">
+            Crawl the website + Commit KB, merge, chunk, embed, index and validate — with live logs.
+            Incremental runs re-embed only changed chunks.</p></div>""", unsafe_allow_html=True)
 
-    def _shdr(num, title, desc, col=LLAMA):
+        def _shdr(num, title, desc, col=LLAMA):
+            st.markdown(f"""
+                <div style="background:{WHITE};border:1px solid {BORDER};border-radius:10px;padding:15px 18px 11px;margin-bottom:10px">
+                  <div style="display:flex;align-items:center;gap:9px;margin-bottom:5px">
+                    <div style="background:{col};color:#fff;width:25px;height:25px;border-radius:50%;display:flex;
+                                align-items:center;justify-content:center;font-weight:800;font-size:0.8rem">{num}</div>
+                    <div style="font-weight:700;color:{TEXT};font-family:'Lora',Georgia,serif;font-size:0.95rem">{title}</div>
+                  </div>
+                  <p style="color:{MUTED};font-size:0.81rem;margin:0;font-family:Inter,sans-serif;line-height:1.5">{desc}</p>
+                </div>""", unsafe_allow_html=True)
+
+        ca, cb = st.columns(2)
+        with ca:
+            _shdr("1", "Incremental Update", "Crawl website + Commit KB, fetch only new/changed pages, merge, "
+                  "re-embed changed chunks, rebuild the index, then validate.")
+            if st.button("🔄  Run incremental update", key="btn_incr", use_container_width=True):
+                from scripts.update_knowledge_base import run as ukb_run
+                h = run_pipeline_live("Incremental update…", ukb_run, website=True, commit_kb=True,
+                                      incremental=True, do_index=True)
+                if "error" in h:
+                    st.error(f"Update failed: {h['error']}")
+                else:
+                    s = h["result"]; m = s.get("merge", {}); v = s.get("validation") or {}
+                    st.success(f"✓ +{m.get('added',0)} new · ~{m.get('updated',0)} changed · "
+                               f"-{m.get('removed',0)} removed · {m.get('total',0)} total")
+                    (st.success if v.get("ok") else st.warning)(
+                        f"Validation: {'PASS' if v.get('ok') else 'issues'} — "
+                        f"{len(v.get('errors',[]))} errors, {len(v.get('warnings',[]))} warnings")
+                    _clear_all_caches()
+        with cb:
+            _shdr("2", "Full Re-scrape", "Re-crawl everything from scratch (ignores crawl state). Re-embeds only "
+                  "where content changed (cache-backed).", col=MARIGOLD_D)
+            if st.button("🌐  Full re-scrape + rebuild", key="btn_full", use_container_width=True):
+                from scripts.update_knowledge_base import run as ukb_run
+                h = run_pipeline_live("Full re-scrape…", ukb_run, website=True, commit_kb=True,
+                                      incremental=False, do_index=True)
+                if "error" in h:
+                    st.error(f"Re-scrape failed: {h['error']}")
+                else:
+                    s = h["result"]; m = s.get("merge", {})
+                    st.success(f"✓ Rebuilt — {m.get('total',0)} documents in the knowledge base.")
+                    _clear_all_caches()
+
+        cc, cd = st.columns(2)
+        with cc:
+            _shdr("3", "Rebuild Index Only", "Re-chunk documents.jsonl and rebuild FAISS from the embedding cache "
+                  "(no crawl). Fast — use after manual edits.", col=INFO_B)
+            if st.button("⚡  Rebuild index", key="btn_reindex", use_container_width=True):
+                from src.incremental_index import rebuild_index
+                h = run_pipeline_live("Rebuilding index…", rebuild_index, use_cache=True)
+                if "error" in h:
+                    st.error(f"Rebuild failed: {h['error']}")
+                else:
+                    s = h["result"]
+                    st.success(f"✓ {s.get('chunks',0):,} chunks from {s.get('documents',0)} docs "
+                               f"(embedded {s.get('embedded',0)}, reused {s.get('cached',0)})")
+                    _clear_all_caches()
+        with cd:
+            _shdr("4", "Validate Knowledge Base", "Check for missing metadata, duplicate URLs, orphan/oversized "
+                  "chunks and index drift.", col=OK_G)
+            if st.button("🩺  Run validation", key="btn_val", use_container_width=True):
+                get_validation.clear()
+                v = get_validation()
+                (st.success if v.get("ok") else st.error)(
+                    f"{'✅ PASS' if v.get('ok') else '❌ FAIL'} — {len(v.get('errors',[]))} errors, "
+                    f"{len(v.get('warnings',[]))} warnings")
+                for e in v.get("errors", []): st.error(f"❌ {e}")
+                for w in v.get("warnings", []): st.warning(f"⚠️ {w}")
+                for i in v.get("info", []): st.caption(f"ℹ️ {i}")
+
+        man = get_last_manifest()
+        if man:
+            st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+            st.markdown(eyebrow("📋 Last Run Summary"), unsafe_allow_html=True)
+            mm = man.get("merge", {}); mi = man.get("index", {}) or {}
+            st.markdown(f"""<div style="background:{WHITE};border:1px solid {BORDER};border-left:4px solid {MARIGOLD};
+                            border-radius:10px;padding:14px 20px;font-family:Inter,sans-serif;font-size:0.83rem;color:{TEXT}">
+                  <strong>{man.get('mode','?').title()} run</strong> · {fmt_dt(man.get('finished_at',''))} ·
+                  {man.get('duration_seconds','?')}s<br>
+                  Merge: +{mm.get('added',0)} / ~{mm.get('updated',0)} / -{mm.get('removed',0)} · {mm.get('total',0)} docs
+                  &nbsp;·&nbsp; Index: {mi.get('chunks','?')} chunks (embedded {mi.get('embedded','?')},
+                  reused {mi.get('cached','?')})</div>""", unsafe_allow_html=True)
+
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
         st.markdown(f"""
-            <div style="background:{WHITE};border:1px solid {BORDER};border-radius:10px;padding:15px 18px 11px;margin-bottom:10px">
-              <div style="display:flex;align-items:center;gap:9px;margin-bottom:5px">
-                <div style="background:{col};color:#fff;width:25px;height:25px;border-radius:50%;display:flex;
-                            align-items:center;justify-content:center;font-weight:800;font-size:0.8rem">{num}</div>
-                <div style="font-weight:700;color:{TEXT};font-family:'Lora',Georgia,serif;font-size:0.95rem">{title}</div>
-              </div>
-              <p style="color:{MUTED};font-size:0.81rem;margin:0;font-family:Inter,sans-serif;line-height:1.5">{desc}</p>
-            </div>""", unsafe_allow_html=True)
-
-    ca, cb = st.columns(2)
-    with ca:
-        _shdr("1", "Incremental Update", "Crawl website + Commit KB, fetch only new/changed pages, merge, "
-              "re-embed changed chunks, rebuild the index, then validate.")
-        if st.button("🔄  Run incremental update", key="btn_incr", use_container_width=True):
-            from scripts.update_knowledge_base import run as ukb_run
-            h = run_pipeline_live("Incremental update…", ukb_run, website=True, commit_kb=True,
-                                  incremental=True, do_index=True)
-            if "error" in h:
-                st.error(f"Update failed: {h['error']}")
-            else:
-                s = h["result"]; m = s.get("merge", {}); v = s.get("validation") or {}
-                st.success(f"✓ +{m.get('added',0)} new · ~{m.get('updated',0)} changed · "
-                           f"-{m.get('removed',0)} removed · {m.get('total',0)} total")
-                (st.success if v.get("ok") else st.warning)(
-                    f"Validation: {'PASS' if v.get('ok') else 'issues'} — "
-                    f"{len(v.get('errors',[]))} errors, {len(v.get('warnings',[]))} warnings")
-                _clear_all_caches()
-    with cb:
-        _shdr("2", "Full Re-scrape", "Re-crawl everything from scratch (ignores crawl state). Re-embeds only "
-              "where content changed (cache-backed).", col=MARIGOLD_D)
-        if st.button("🌐  Full re-scrape + rebuild", key="btn_full", use_container_width=True):
-            from scripts.update_knowledge_base import run as ukb_run
-            h = run_pipeline_live("Full re-scrape…", ukb_run, website=True, commit_kb=True,
-                                  incremental=False, do_index=True)
-            if "error" in h:
-                st.error(f"Re-scrape failed: {h['error']}")
-            else:
-                s = h["result"]; m = s.get("merge", {})
-                st.success(f"✓ Rebuilt — {m.get('total',0)} documents in the knowledge base.")
-                _clear_all_caches()
-
-    cc, cd = st.columns(2)
-    with cc:
-        _shdr("3", "Rebuild Index Only", "Re-chunk documents.jsonl and rebuild FAISS from the embedding cache "
-              "(no crawl). Fast — use after manual edits.", col=INFO_B)
-        if st.button("⚡  Rebuild index", key="btn_reindex", use_container_width=True):
-            from src.incremental_index import rebuild_index
-            h = run_pipeline_live("Rebuilding index…", rebuild_index, use_cache=True)
-            if "error" in h:
-                st.error(f"Rebuild failed: {h['error']}")
-            else:
-                s = h["result"]
-                st.success(f"✓ {s.get('chunks',0):,} chunks from {s.get('documents',0)} docs "
-                           f"(embedded {s.get('embedded',0)}, reused {s.get('cached',0)})")
-                _clear_all_caches()
-    with cd:
-        _shdr("4", "Validate Knowledge Base", "Check for missing metadata, duplicate URLs, orphan/oversized "
-              "chunks and index drift.", col=OK_G)
-        if st.button("🩺  Run validation", key="btn_val", use_container_width=True):
-            get_validation.clear()
-            v = get_validation()
-            (st.success if v.get("ok") else st.error)(
-                f"{'✅ PASS' if v.get('ok') else '❌ FAIL'} — {len(v.get('errors',[]))} errors, "
-                f"{len(v.get('warnings',[]))} warnings")
-            for e in v.get("errors", []): st.error(f"❌ {e}")
-            for w in v.get("warnings", []): st.warning(f"⚠️ {w}")
-            for i in v.get("info", []): st.caption(f"ℹ️ {i}")
-
-    man = get_last_manifest()
-    if man:
-        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-        st.markdown(eyebrow("📋 Last Run Summary"), unsafe_allow_html=True)
-        mm = man.get("merge", {}); mi = man.get("index", {}) or {}
-        st.markdown(f"""<div style="background:{WHITE};border:1px solid {BORDER};border-left:4px solid {MARIGOLD};
-                        border-radius:10px;padding:14px 20px;font-family:Inter,sans-serif;font-size:0.83rem;color:{TEXT}">
-              <strong>{man.get('mode','?').title()} run</strong> · {fmt_dt(man.get('finished_at',''))} ·
-              {man.get('duration_seconds','?')}s<br>
-              Merge: +{mm.get('added',0)} / ~{mm.get('updated',0)} / -{mm.get('removed',0)} · {mm.get('total',0)} docs
-              &nbsp;·&nbsp; Index: {mi.get('chunks','?')} chunks (embedded {mi.get('embedded','?')},
-              reused {mi.get('cached','?')})</div>""", unsafe_allow_html=True)
-
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    st.markdown(f"""
-        <div style="background:{CREAM};border:1px solid {BORDER};border-left:4px solid {MARIGOLD};
-                    border-radius:10px;padding:16px 22px">
-          {eyebrow('🔐 Terminal equivalents (need .env credentials)', GOLD_TEXT)}
-          <pre style="background:{WHITE};border:1px solid {BORDER};border-radius:7px;padding:12px 14px;
-                      font-size:0.78rem;color:{TEXT};overflow:auto;margin:0">python scripts/rescrape_all.py --reset-state   # one-time full rebuild
+            <div style="background:{CREAM};border:1px solid {BORDER};border-left:4px solid {MARIGOLD};
+                        border-radius:10px;padding:16px 22px">
+              {eyebrow('🔐 Terminal equivalents (need .env credentials)', GOLD_TEXT)}
+              <pre style="background:{WHITE};border:1px solid {BORDER};border-radius:7px;padding:12px 14px;
+                          font-size:0.78rem;color:{TEXT};overflow:auto;margin:0">python scripts/rescrape_all.py --reset-state   # one-time full rebuild
 python scripts/update_knowledge_base.py         # incremental (website + Commit KB)
 python scripts/build_index.py                   # rebuild index from documents.jsonl
 python scripts/validate_kb.py                   # KB health check
@@ -1537,93 +1565,94 @@ python scripts/dedupe_documents.py              # collapse duplicate-URL documen
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 6 — AUTOMATION
 # ════════════════════════════════════════════════════════════════════════════
-with tabs[5]:
-    st.markdown(f"""<div style="margin-bottom:16px">
-      <h2 style="margin:0 0 5px">Automation</h2>
-      <p style="color:{MUTED};font-family:Inter,sans-serif;font-size:0.88rem;margin:0">
-        Weekly self-refresh — every {str(config.SCHEDULE_DAY).title()} at {config.SCHEDULE_HOUR:02d}:{config.SCHEDULE_MINUTE:02d}
-        {config.SCHEDULE_TIMEZONE}.</p></div>""", unsafe_allow_html=True)
+if IS_ADMIN:
+    with tabs[5]:
+        st.markdown(f"""<div style="margin-bottom:16px">
+          <h2 style="margin:0 0 5px">Automation</h2>
+          <p style="color:{MUTED};font-family:Inter,sans-serif;font-size:0.88rem;margin:0">
+            Weekly self-refresh — every {str(config.SCHEDULE_DAY).title()} at {config.SCHEDULE_HOUR:02d}:{config.SCHEDULE_MINUTE:02d}
+            {config.SCHEDULE_TIMEZONE}.</p></div>""", unsafe_allow_html=True)
 
-    sched = get_scheduler_status()
-    nxt = next_scheduled_run()
-    last_state = (sched or {}).get("state", "—")
-    last_run = (sched or {}).get("finished_at") or (sched or {}).get("started_at")
-    sc = {"success": OK_G, "error": ERR_R, "running": WARN_A}.get(last_state, MUTED)
+        sched = get_scheduler_status()
+        nxt = next_scheduled_run()
+        last_state = (sched or {}).get("state", "—")
+        last_run = (sched or {}).get("finished_at") or (sched or {}).get("started_at")
+        sc = {"success": OK_G, "error": ERR_R, "running": WARN_A}.get(last_state, MUTED)
 
-    a1, a2, a3 = st.columns(3)
-    with a1:
-        st.markdown(f"""<div style="background:linear-gradient(135deg,{LLAMA_M},{LLAMA_D});border-radius:12px;
-                        padding:20px 22px;color:#fff">
-              <div style="font-size:0.62rem;text-transform:uppercase;letter-spacing:.14em;font-weight:700;
-                          color:{MARIGOLD};font-family:Inter,sans-serif">Next scheduled run</div>
-              <div style="font-size:1.35rem;font-weight:700;font-family:'Lora',serif;margin-top:6px">{nxt.strftime('%a, %d %b')}</div>
-              <div style="font-size:0.9rem;color:{CREAM};font-family:Inter,sans-serif">{nxt.strftime('%H:%M')} {config.SCHEDULE_TIMEZONE}</div>
-            </div>""", unsafe_allow_html=True)
-    with a2:
-        st.markdown(f"""<div style="background:{WHITE};border:1px solid {BORDER};border-top:3px solid {sc};
-                        border-radius:12px;padding:20px 22px">
-              <div style="font-size:0.62rem;text-transform:uppercase;letter-spacing:.14em;font-weight:700;
-                          color:{MUTED};font-family:Inter,sans-serif">Last run</div>
-              <div style="font-size:1.3rem;font-weight:700;font-family:'Lora',serif;color:{sc};margin-top:6px">{str(last_state).title()}</div>
-              <div style="font-size:0.82rem;color:{MUTED};font-family:Inter,sans-serif">{fmt_dt(last_run)}</div>
-            </div>""", unsafe_allow_html=True)
-    with a3:
-        dur = (sched or {}).get("duration_seconds")
-        chg = ((sched or {}).get("summary") or {}).get("changed_documents", "—")
-        st.markdown(f"""<div style="background:{WHITE};border:1px solid {BORDER};border-top:3px solid {MARIGOLD};
-                        border-radius:12px;padding:20px 22px">
-              <div style="font-size:0.62rem;text-transform:uppercase;letter-spacing:.14em;font-weight:700;
-                          color:{MUTED};font-family:Inter,sans-serif">Last run detail</div>
-              <div style="font-size:1.3rem;font-weight:700;font-family:'Lora',serif;color:{LLAMA};margin-top:6px">{chg} changed</div>
-              <div style="font-size:0.82rem;color:{MUTED};font-family:Inter,sans-serif">
-                {f'{dur:.0f}s' if isinstance(dur,(int,float)) else '—'} duration</div>
-            </div>""", unsafe_allow_html=True)
+        a1, a2, a3 = st.columns(3)
+        with a1:
+            st.markdown(f"""<div style="background:linear-gradient(135deg,{LLAMA_M},{LLAMA_D});border-radius:12px;
+                            padding:20px 22px;color:#fff">
+                  <div style="font-size:0.62rem;text-transform:uppercase;letter-spacing:.14em;font-weight:700;
+                              color:{MARIGOLD};font-family:Inter,sans-serif">Next scheduled run</div>
+                  <div style="font-size:1.35rem;font-weight:700;font-family:'Lora',serif;margin-top:6px">{nxt.strftime('%a, %d %b')}</div>
+                  <div style="font-size:0.9rem;color:{CREAM};font-family:Inter,sans-serif">{nxt.strftime('%H:%M')} {config.SCHEDULE_TIMEZONE}</div>
+                </div>""", unsafe_allow_html=True)
+        with a2:
+            st.markdown(f"""<div style="background:{WHITE};border:1px solid {BORDER};border-top:3px solid {sc};
+                            border-radius:12px;padding:20px 22px">
+                  <div style="font-size:0.62rem;text-transform:uppercase;letter-spacing:.14em;font-weight:700;
+                              color:{MUTED};font-family:Inter,sans-serif">Last run</div>
+                  <div style="font-size:1.3rem;font-weight:700;font-family:'Lora',serif;color:{sc};margin-top:6px">{str(last_state).title()}</div>
+                  <div style="font-size:0.82rem;color:{MUTED};font-family:Inter,sans-serif">{fmt_dt(last_run)}</div>
+                </div>""", unsafe_allow_html=True)
+        with a3:
+            dur = (sched or {}).get("duration_seconds")
+            chg = ((sched or {}).get("summary") or {}).get("changed_documents", "—")
+            st.markdown(f"""<div style="background:{WHITE};border:1px solid {BORDER};border-top:3px solid {MARIGOLD};
+                            border-radius:12px;padding:20px 22px">
+                  <div style="font-size:0.62rem;text-transform:uppercase;letter-spacing:.14em;font-weight:700;
+                              color:{MUTED};font-family:Inter,sans-serif">Last run detail</div>
+                  <div style="font-size:1.3rem;font-weight:700;font-family:'Lora',serif;color:{LLAMA};margin-top:6px">{chg} changed</div>
+                  <div style="font-size:0.82rem;color:{MUTED};font-family:Inter,sans-serif">
+                    {f'{dur:.0f}s' if isinstance(dur,(int,float)) else '—'} duration</div>
+                </div>""", unsafe_allow_html=True)
 
-    st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-    mcol = st.columns([1, 1, 3])
-    with mcol[0]:
-        if st.button("▶️ Run update now", key="auto_run", use_container_width=True):
-            from scripts.update_knowledge_base import run as ukb_run
-            h = run_pipeline_live("Manual run…", ukb_run, website=True, commit_kb=True, incremental=True, do_index=True)
-            if "error" in h:
-                st.error(f"Run failed: {h['error']}")
-            else:
-                st.success("✓ Update complete.")
-                get_scheduler_status.clear(); get_run_history.clear(); _clear_all_caches()
-    with mcol[1]:
-        if st.button("↻ Refresh status", key="auto_refresh", use_container_width=True):
-            get_scheduler_status.clear(); get_run_history.clear(); st.rerun()
+        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+        mcol = st.columns([1, 1, 3])
+        with mcol[0]:
+            if st.button("▶️ Run update now", key="auto_run", use_container_width=True):
+                from scripts.update_knowledge_base import run as ukb_run
+                h = run_pipeline_live("Manual run…", ukb_run, website=True, commit_kb=True, incremental=True, do_index=True)
+                if "error" in h:
+                    st.error(f"Run failed: {h['error']}")
+                else:
+                    st.success("✓ Update complete.")
+                    get_scheduler_status.clear(); get_run_history.clear(); _clear_all_caches()
+        with mcol[1]:
+            if st.button("↻ Refresh status", key="auto_refresh", use_container_width=True):
+                get_scheduler_status.clear(); get_run_history.clear(); st.rerun()
 
-    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-    st.markdown(eyebrow("🗂️ Run History"), unsafe_allow_html=True)
-    hist = get_run_history()
-    if hist:
-        hrows = []
-        for r in hist:
-            m = r.get("merge", {}); i = r.get("index", {}) or {}; v = r.get("validation") or {}
-            hrows.append({"Finished": fmt_dt(r.get("finished_at", "")), "Mode": r.get("mode", ""),
-                          "Added": m.get("added", 0), "Updated": m.get("updated", 0), "Removed": m.get("removed", 0),
-                          "Chunks": i.get("chunks", "—"),
-                          "Validation": "PASS" if v.get("ok") else ("FAIL" if v.get("ok") is False else "—"),
-                          "Duration(s)": r.get("duration_seconds", "—")})
-        st.dataframe(pd.DataFrame(hrows), use_container_width=True, height=300)
-    else:
-        st.info("No ingestion reports yet. They appear after the first scheduled or manual run "
-                "(`data/logs/ingestion_report_*.json`).")
+        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+        st.markdown(eyebrow("🗂️ Run History"), unsafe_allow_html=True)
+        hist = get_run_history()
+        if hist:
+            hrows = []
+            for r in hist:
+                m = r.get("merge", {}); i = r.get("index", {}) or {}; v = r.get("validation") or {}
+                hrows.append({"Finished": fmt_dt(r.get("finished_at", "")), "Mode": r.get("mode", ""),
+                              "Added": m.get("added", 0), "Updated": m.get("updated", 0), "Removed": m.get("removed", 0),
+                              "Chunks": i.get("chunks", "—"),
+                              "Validation": "PASS" if v.get("ok") else ("FAIL" if v.get("ok") is False else "—"),
+                              "Duration(s)": r.get("duration_seconds", "—")})
+            st.dataframe(pd.DataFrame(hrows), use_container_width=True, height=300)
+        else:
+            st.info("No ingestion reports yet. They appear after the first scheduled or manual run "
+                    "(`data/logs/ingestion_report_*.json`).")
 
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    st.markdown(f"""
-        <div style="background:{CREAM};border:1px solid {BORDER};border-left:4px solid {MARIGOLD};
-                    border-radius:10px;padding:16px 22px">
-          {eyebrow('🖥️ Set up the weekly job', GOLD_TEXT)}
-          <p style="font-size:0.83rem;color:{TEXT};font-family:Inter,sans-serif;line-height:1.6;margin:0 0 8px">
-            Windows (recommended — survives reboots):</p>
-          <pre style="background:{WHITE};border:1px solid {BORDER};border-radius:7px;padding:12px 14px;
-                      font-size:0.78rem;color:{TEXT};overflow:auto;margin:0 0 10px">powershell -ExecutionPolicy Bypass -File scripts\\setup_windows_task.ps1</pre>
-          <p style="font-size:0.83rem;color:{TEXT};font-family:Inter,sans-serif;line-height:1.6;margin:0 0 8px">
-            Cross-platform (long-running scheduler):</p>
-          <pre style="background:{WHITE};border:1px solid {BORDER};border-radius:7px;padding:12px 14px;
-                      font-size:0.78rem;color:{TEXT};overflow:auto;margin:0">python scripts/scheduler.py            # blocks; fires weekly
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        st.markdown(f"""
+            <div style="background:{CREAM};border:1px solid {BORDER};border-left:4px solid {MARIGOLD};
+                        border-radius:10px;padding:16px 22px">
+              {eyebrow('🖥️ Set up the weekly job', GOLD_TEXT)}
+              <p style="font-size:0.83rem;color:{TEXT};font-family:Inter,sans-serif;line-height:1.6;margin:0 0 8px">
+                Windows (recommended — survives reboots):</p>
+              <pre style="background:{WHITE};border:1px solid {BORDER};border-radius:7px;padding:12px 14px;
+                          font-size:0.78rem;color:{TEXT};overflow:auto;margin:0 0 10px">powershell -ExecutionPolicy Bypass -File scripts\\setup_windows_task.ps1</pre>
+              <p style="font-size:0.83rem;color:{TEXT};font-family:Inter,sans-serif;line-height:1.6;margin:0 0 8px">
+                Cross-platform (long-running scheduler):</p>
+              <pre style="background:{WHITE};border:1px solid {BORDER};border-radius:7px;padding:12px 14px;
+                          font-size:0.78rem;color:{TEXT};overflow:auto;margin:0">python scripts/scheduler.py            # blocks; fires weekly
 python scripts/scheduler.py --run-now  # run now, then keep schedule
 python scripts/scheduler.py --status   # last run result</pre>
         </div>""", unsafe_allow_html=True)

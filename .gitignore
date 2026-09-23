@@ -1,60 +1,80 @@
-# Virtual environments
+# ── Secrets ─────────────────────────────────────────────────────────────────────
+.env
+.env.*
+!env.example
+.streamlit/secrets.toml
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+service-account*.json
+*.secret
+
+# ── Python / tooling ───────────────────────────────────────────────────────────
 .venv/
 venv/
 env/
-
-# Environment variables
-.env
-.streamlit/secrets.toml
-
-# Python cache
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.ruff_cache/
+.vscode/
 
-# Large archives
+# ── Knowledge-base data (built by the refresh; distributed as an ENCRYPTED
+#    release bundle, never committed — the Commit KB is internal) ────────────────
+data/processed/
+data/index/
+data/releases/
+data/staging/
+data/state/
+data/raw/
+data/logs/
+data/backups/
+commit_kb_clean_crawled/
+data/knowledge_base/takshashila_commit_kb*
+data/knowledge_base/takshashila_website*
+data/knowledge_base/people.json
+*.tkkb
+kb-manifest.json
+kb-status.json
+dist-kb/
+prev/
+refresh-output.json
+vectordb/
+*.faiss
+*.npz
+*.pkl
+
+# Reports: runtime/internal reports are ignored; the PUBLIC website audit
+# deliverables are whitelisted below.
+data/reports/*
+!data/reports/website_audit.json
+!data/reports/website_audit.csv
+!data/reports/broken_links.csv
+!data/reports/redirects.csv
+!data/reports/orphan_pages.csv
+!data/reports/crawl_summary.json
+!data/reports/kb_validation.json
+
+# ── Build outputs / misc ─────────────────────────────────────────────────────────
+frontend/dist/
+*.log
 *.zip
 *.7z
 *.rar
-
-# Executables
 *.exe
-
-# Local models
 models/
 *.gguf
-
-# Backup files
 *.backup_*
 *.bak
 *.bak_*
 *.backup
 
-# Embedding cache (can be regenerated)
-data/index/embedding_cache.npz
-
-# VS Code
-.vscode/
-
-# Logs
-*.log
-
-
-# Raw crawl data
-data/raw/
-
-# Runtime logs
-data/logs/
-
-# Archives
-*.zip
-
-# Local executables
-*.exe
-
-# Python
-.venv/
-__pycache__/
-
-# Secrets
-.env
-.streamlit/secrets.toml
+# ── Temporary / partial files ───────────────────────────────────────────────────
+*.tmp
+*.download
+*.partial
+*.swp
+.DS_Store
+Thumbs.db

@@ -1,0 +1,50 @@
+{
+  "ok": true,
+  "counts": {
+    "documents": 1847,
+    "chunks": 33356,
+    "index_vectors": 33356,
+    "by_source": {
+      "website": 1770,
+      "commit_kb": 62,
+      "local": 15
+    },
+    "by_content_type": {
+      "op-ed": 389,
+      "people_index": 1,
+      "tracker": 46,
+      "research_area": 17,
+      "course": 22,
+      "podcast": 3,
+      "newsletter": 1,
+      "about": 11,
+      "page": 2,
+      "programme": 11,
+      "book": 17,
+      "person": 95,
+      "publication": 452,
+      "event": 18,
+      "career": 4,
+      "blog": 302,
+      "pdf": 379,
+      "listing": 2,
+      "insight": 7,
+      "decision": 15,
+      "playbook": 29,
+      "note": 3,
+      "idea": 5,
+      "kb": 1,
+      "holiday": 15
+    }
+  },
+  "errors": [],
+  "warnings": [
+    "18 publication/blog/op-ed document(s) without an author."
+  ],
+  "info": [
+    "1847 documents; by source {'website': 1770, 'commit_kb': 62, 'local': 15}; by type {'op-ed': 389, 'people_index': 1, 'tracker': 46, 'research_area': 17, 'course': 22, 'podcast': 3, 'newsletter': 1, 'about': 11, 'page': 2, 'programme': 11, 'book': 17, 'person': 95, 'publication': 452, 'event': 18, 'career': 4, 'blog': 302, 'pdf': 379, 'listing': 2, 'insight': 7, 'decision': 15, 'playbook': 29, 'note': 3, 'idea': 5, 'kb': 1, 'holiday': 15}",
+    "33356 chunks; avg 775 chars",
+    "FAISS index: 33356 vectors, dim 384."
+  ],
+  "kb_version": "20260923T203939p0530"
+}

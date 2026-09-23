@@ -126,7 +126,7 @@ tests/
 
 README_MATTERMOST_BOT.md           ← this file
 .env.example / env.example         ← env templates (copy .env.example to .env)
-Dockerfile.mattermost              ← optional containerised deployment
+Dockerfile / Dockerfile.mattermost ← production image (API + bot); see DEPLOYMENT.md
 requirements.txt                   ← FastAPI/uvicorn/httpx/python-multipart/pymupdf
 ```
 
@@ -488,6 +488,7 @@ MATTERMOST_SLASH_TOKEN=...             # Slash Command token
 | `MATTERMOST_PRIVATE_DELIVERY` | `dm` | `dm` (full buttons) or `ephemeral`. |
 | `MATTERMOST_ALLOWED_TEAM_IDS` | — | Comma-separated allowlist (empty = all). |
 | `MATTERMOST_ALLOWED_CHANNEL_IDS` | — | Comma-separated allowlist (also applied to `--channel`). |
+| `MATTERMOST_BLOCK_GUESTS` | `true` | Keep internal answers away from guest accounts and channels containing guests. |
 | `MATTERMOST_RAG_TOP_K` | `5` | Retrieval depth for the bot. |
 | `MATTERMOST_RAG_TEMPERATURE` | `0.1` | Generation temperature. |
 | `MATTERMOST_MAX_MESSAGE_CHARS` | `12000` | Truncation guard. |
@@ -533,7 +534,7 @@ See [Environment variables](#environment-variables) above.
 ### 3. Run the bot locally
 
 ```bash
-uvicorn integrations.mattermost_bot:app --host 0.0.0.0 --port 8000
+uvicorn api.main:app --host 0.0.0.0 --port 8000   # API + bot (same as production)
 ```
 
 Verify health:
@@ -619,61 +620,60 @@ Then, inside Mattermost, work through these:
 
 ---
 
-## Production deployment
+## Production deployment (laptop-independent)
 
-- Run the bot on an internal VM the Mattermost server can reach.
-- Put **HTTPS** in front via Nginx (Mattermost prefers HTTPS).
-- Keep `.env` secure (chmod 600; `.gitignore` already blocks it).
-- Run it as a long-lived service via **systemd** or **Docker**.
-- Ensure `data/index/faiss.index` (+ metadata) exists and `GROQ_API_KEY` is set.
+The bot is no longer a separate service. Its routes (`/mattermost/*`, `/voice`) are
+mounted into the production API (`api/main.py`) and deployed as one Docker image on
+Railway — see **DEPLOYMENT.md**. Mattermost therefore calls:
 
-### systemd (`/etc/systemd/system/takshashila-mm-bot.service`)
+| Mattermost setting | Value |
+|---|---|
+| Slash command Request URL | `https://<service>.up.railway.app/mattermost/ask` |
+| `MATTERMOST_BOT_PUBLIC_URL` (buttons, dialogs, voice) | `https://<service>.up.railway.app` |
 
-```ini
-[Unit]
-Description=Takshashila Mattermost RAG Bot
-After=network.target
+The knowledge base is refreshed daily at 06:00 IST by GitHub Actions and hot-swapped
+into the running API, so `/askkb` answers always come from the latest validated KB.
+Answers use the same engine as the website (`src.rag_pipeline`) with the internal
+scope (Commit KB + website + curated files).
 
-[Service]
-WorkingDirectory=/opt/takshashila-rag
-EnvironmentFile=/opt/takshashila-rag/.env
-ExecStart=/opt/takshashila-rag/.venv/bin/uvicorn integrations.mattermost_bot:app --host 0.0.0.0 --port 8000
-Restart=on-failure
-User=takshashila
-
-[Install]
-WantedBy=multi-user.target
-```
+The legacy standalone app still works for local development:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now takshashila-mm-bot
-sudo journalctl -u takshashila-mm-bot -f
+uvicorn integrations.mattermost_bot:app --port 8000   # bot routes only
+uvicorn api.main:app --port 8000                      # full API + bot (production layout)
 ```
 
-### Nginx reverse proxy
+### Callback security (new)
 
-```nginx
-location /mattermost/ {
-    proxy_pass http://127.0.0.1:8000;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_read_timeout 60s;
-}
-location = /voice { proxy_pass http://127.0.0.1:8000; }
-```
+Mattermost does not sign interactive-button or dialog callbacks, and the callback
+URLs are public. The bot therefore:
 
-### Docker
+* checks the slash-command token with a constant-time comparison;
+* HMAC-signs every button `context` and dialog `state` it issues
+  (`MATTERMOST_ACTION_SECRET`, default: the slash token) and rejects unsigned or
+  modified callbacks with 403;
+* binds dialog state to the originating channel;
+* verifies, via the Mattermost API, that the post named in a delete action belongs to
+  the channel in the request before deleting anything;
+* signs voice links only when a real secret is configured (no built-in fallback key).
+* binds every button context to the channel it was posted in (`cid`, part of the
+  signature) and refuses a context replayed from any other channel.
 
-```bash
-docker build -f Dockerfile.mattermost -t takshashila-mm-bot .
-docker run -d --name takshashila-mm-bot \
-  -p 8000:8000 --env-file .env \
-  -v "$(pwd)/data:/app/data" \
-  takshashila-mm-bot
-```
+### Internal-content boundaries
 
----
+Answers come from the internal Commit KB, so the bot never lets them reach people
+outside the staff (`MATTERMOST_BLOCK_GUESTS=true`, the default; needs the bot token
+to read roles — without it the bot fails closed):
+
+* guest accounts cannot use `/askkb` or its buttons;
+* `--user` / `--group` refuse guest recipients;
+* `--channel` requires the requester to be a member of the target channel and
+  refuses channels containing guests (plus the existing allowlist and bot membership);
+* a `public` answer (or public voice answer) in a channel with guests is delivered
+  privately instead; export and "related documents" buttons are refused there.
+
+Buttons on posts created before this change stop working (they carry no signature);
+re-run the question to get fresh buttons.
 
 ## Troubleshooting
 

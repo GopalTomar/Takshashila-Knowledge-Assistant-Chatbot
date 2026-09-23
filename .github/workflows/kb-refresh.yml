@@ -1,0 +1,168 @@
+# Daily knowledge-base refresh — runs on GitHub's servers (no laptop needed).
+#
+# GitHub cron is UTC-only and may start late, so this workflow polls every 30
+# minutes and scripts/refresh_gate.py decides whether the refresh is due, using
+# KB_REFRESH_TIME + KB_REFRESH_TIMEZONE (default 06:00 Asia/Kolkata). At most one
+# attempt per local day; the next day retries normally.
+#
+# Flow: restore last published KB → incremental crawl (website + Commit KB) →
+# re-embed changed chunks → FAISS/BM25 → validate + smoke test → publish an
+# ENCRYPTED bundle to the "kb-latest" release → the Railway API picks it up.
+# A failed run publishes nothing but status; the API keeps the previous KB.
+#
+# Required repository secrets: KB_BUNDLE_KEY, COMMIT_KB_USERNAME, COMMIT_KB_PASSWORD
+# Optional repository variables: KB_REFRESH_TIME, KB_REFRESH_TIMEZONE, KB_REFRESH_ENABLED
+name: KB daily refresh
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Run now even if today's refresh already happened"
+        type: boolean
+        default: true
+      full:
+        description: "Full crawl (ignore incremental state)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: kb-refresh
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: kb-latest
+  KB_REFRESH_TIME: ${{ vars.KB_REFRESH_TIME || '06:00' }}
+  KB_REFRESH_TIMEZONE: ${{ vars.KB_REFRESH_TIMEZONE || 'Asia/Kolkata' }}
+  KB_REFRESH_ENABLED: ${{ vars.KB_REFRESH_ENABLED || 'true' }}
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write          # keepalive: re-enable this workflow (see last step)
+    outputs:
+      due: ${{ steps.gate.outputs.due }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/refresh_gate.py
+          sparse-checkout-cone-mode: false
+      - name: Fetch last refresh status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$RELEASE_TAG" -p kb-status.json -D . --repo "$GITHUB_REPOSITORY" || echo "no status yet"
+      - id: gate
+        name: Is the refresh due?
+        run: |
+          python scripts/refresh_gate.py --status-file kb-status.json \
+            ${{ (github.event_name == 'workflow_dispatch' && inputs.force) && '--force' || '' }}
+      # GitHub disables scheduled workflows after 60 days without repository
+      # activity. Re-enabling via the API resets that timer, so the daily refresh
+      # keeps running even when nobody commits. Harmless when already enabled.
+      - name: Keep the schedule alive
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/kb-refresh.yml/enable" || echo "keepalive skipped"
+
+  refresh:
+    needs: gate
+    if: needs.gate.outputs.due == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      KB_BUNDLE_KEY: ${{ secrets.KB_BUNDLE_KEY }}
+      COMMIT_KB_URL: ${{ vars.COMMIT_KB_URL || 'https://commit.takshashila.org.in/' }}
+      COMMIT_KB_USERNAME: ${{ secrets.COMMIT_KB_USERNAME }}
+      COMMIT_KB_PASSWORD: ${{ secrets.COMMIT_KB_PASSWORD }}
+      WEBSITE_MAX_PAGES: "5000"
+      WEBSITE_MAX_DEPTH: "8"
+      SCRAPE_MAX_RPS: "4"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      PYTHONIOENCODING: utf-8
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install dependencies (CPU-only torch)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-bge-small-en-v1.5
+
+      - name: Check required secrets
+        run: |
+          test -n "$KB_BUNDLE_KEY" || { echo "::error::KB_BUNDLE_KEY secret is not set"; exit 1; }
+          test -n "$COMMIT_KB_USERNAME" || echo "::warning::COMMIT_KB_USERNAME not set — Commit KB will be skipped"
+
+      - name: Ensure release exists
+        run: |
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || gh release create "$RELEASE_TAG" \
+            --prerelease --title "Knowledge base (latest, encrypted)" \
+            --notes "Encrypted knowledge-base bundle published by the daily refresh workflow. Not a code release."
+
+      - name: Restore last published KB
+        run: |
+          mkdir -p prev
+          gh release download "$RELEASE_TAG" -p "kb-*" -D prev || true
+          python scripts/kb_release.py restore --from-dir prev
+
+      - name: Refresh knowledge base
+        id: refresh
+        continue-on-error: true
+        run: |
+          python scripts/refresh_kb.py --all ${{ inputs.full && '--full' || '' }} --json > refresh-output.json
+          tail -c 4000 refresh-output.json
+
+      - name: Publish encrypted KB bundle
+        if: steps.refresh.outcome == 'success'
+        run: |
+          python scripts/kb_release.py pack --out-dir dist-kb
+          # Bundle first, manifest last: the API only ever sees a complete upload.
+          gh release upload "$RELEASE_TAG" dist-kb/*.tkkb --clobber
+          gh release upload "$RELEASE_TAG" dist-kb/kb-manifest.json --clobber
+          # Keep the two newest bundles.
+          gh release view "$RELEASE_TAG" --json assets -q '.assets[].name' | grep '\.tkkb$' | sort | head -n -2 \
+            | xargs -r -I{} gh release delete-asset "$RELEASE_TAG" {} -y
+
+      - name: Publish refresh status
+        if: always()
+        run: |
+          python scripts/kb_release.py status --out kb-status.json
+          gh release upload "$RELEASE_TAG" kb-status.json --clobber
+
+      - name: Upload public website audit reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: website-refresh-reports
+          path: |
+            data/reports/crawl/website_latest.json
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Fail the run if the refresh failed
+        if: steps.refresh.outcome != 'success'
+        run: |
+          echo "::error::Knowledge-base refresh failed — the previously published KB remains active."
+          exit 1

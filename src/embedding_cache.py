@@ -29,14 +29,14 @@ from src.utils import content_hash, get_logger
 
 logger = get_logger("embedding_cache", config.SCRAPE_LOG)
 
-CACHE_FILE = config.INDEX_DIR / "embedding_cache.npz"
 
 
 class EmbeddingCache:
     """A hash → vector store that fills misses via ``embeddings.embed_texts``."""
 
-    def __init__(self, path: Path = CACHE_FILE):
-        self.path = path
+    def __init__(self, path: Optional[Path] = None):
+        # Resolved at construction so a staging build uses the staging cache.
+        self.path = Path(path) if path else config.EMBEDDING_CACHE_FILE
         self._store: Dict[str, np.ndarray] = {}
         self._dim: Optional[int] = None
         self._load()
@@ -92,14 +92,22 @@ class EmbeddingCache:
         stats = {"cached": len(chunks) - len(missing_idx), "embedded": len(missing_idx)}
 
         if missing_idx:
-            miss_texts = [chunk_search_text(chunks[i]) for i in missing_idx]
-            logger.info(f"Embedding {len(miss_texts)} new/changed chunks "
+            logger.info(f"Embedding {len(missing_idx)} new/changed chunks "
                         f"({stats['cached']} reused from cache)…")
-            new_vecs = embed_texts(miss_texts, show_progress=show_progress)
-            if self._dim is None and len(new_vecs):
-                self._dim = int(new_vecs.shape[1])
-            for j, i in enumerate(missing_idx):
-                self._store[keys[i]] = new_vecs[j]
+            # Embed in blocks and checkpoint the cache after each one, so a crash or
+            # timeout part-way through a large (re)build resumes instead of restarting.
+            block = 2048
+            for start in range(0, len(missing_idx), block):
+                part = missing_idx[start:start + block]
+                new_vecs = embed_texts([chunk_search_text(chunks[i]) for i in part],
+                                       show_progress=show_progress)
+                if self._dim is None and len(new_vecs):
+                    self._dim = int(new_vecs.shape[1])
+                for j, i in enumerate(part):
+                    self._store[keys[i]] = new_vecs[j]
+                if len(missing_idx) > block:
+                    self.save()
+                    logger.info(f"  embedded {min(start + block, len(missing_idx))}/{len(missing_idx)}")
         else:
             logger.info(f"All {len(chunks)} chunks served from embedding cache.")
 

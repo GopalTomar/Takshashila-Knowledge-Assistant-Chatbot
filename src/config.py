@@ -14,23 +14,84 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-ROOT_DIR        = Path(__file__).parent.parent
-DATA_DIR        = ROOT_DIR / "data"
+ROOT_DIR        = Path(__file__).resolve().parent.parent
+# Generated, private runtime data (KB releases, crawl state, logs, reports).
+# Point DATA_DIR at a local, NON-synced directory (e.g. outside OneDrive/Dropbox):
+# releases are ~340 MB each and contain internal Commit KB content.
+DATA_DIR        = Path(os.path.expandvars(os.path.expanduser(
+    os.getenv("DATA_DIR") or str(ROOT_DIR / "data")))).resolve()      # empty value = default
+LOGS_DIR        = DATA_DIR / "logs"
+REPORTS_DIR     = DATA_DIR / "reports"
 RAW_HTML_DIR    = DATA_DIR / "raw" / "html"
 RAW_PDF_DIR     = DATA_DIR / "raw" / "pdfs"
-PROCESSED_DIR   = DATA_DIR / "processed"
-INDEX_DIR       = DATA_DIR / "index"
-LOGS_DIR        = DATA_DIR / "logs"
 
-# Dedicated knowledge-base area (RAG-ready, normalized documents)
-KB_DIR          = DATA_DIR / "knowledge_base"
+# Curated source inputs maintained by hand and tracked in git (holiday list, …).
+# Deliberately NOT under DATA_DIR, so moving DATA_DIR never drops these inputs.
+KB_DIR          = Path(os.getenv("KB_INPUT_DIR") or str(ROOT_DIR / "data" / "knowledge_base")).resolve()
 
-DOCUMENTS_FILE  = PROCESSED_DIR / "documents.jsonl"   # unified docs used to build the index
-CHUNKS_FILE     = PROCESSED_DIR / "chunks.jsonl"
-FAISS_INDEX     = INDEX_DIR / "faiss.index"
-METADATA_FILE   = INDEX_DIR / "metadata.pkl"
+# ── Switchable KB root ────────────────────────────────────────────────────────────
+# Everything the RAG engine *serves* (documents, chunks, FAISS, metadata, crawl
+# state, people graph) lives under one "KB root". Production uses DATA_DIR; the
+# refresh pipeline builds into a staging root and a server can activate a
+# downloaded release root — see use_kb_root(). The derived path constants below
+# are re-pointed together so a half-updated mix of files is never read.
+KB_ROOT: Path = DATA_DIR
+PROCESSED_DIR = DOCUMENTS_FILE = CHUNKS_FILE = INDEX_DIR = FAISS_INDEX = None  # set below
+METADATA_FILE = METADATA_JSON = EMBEDDING_CACHE_FILE = STATE_DIR = PEOPLE_FILE = None
+KB_MANIFEST_FILE = None
+
+
+def use_kb_root(root) -> Path:
+    """Point every KB path constant at ``root`` (a directory). Returns the root."""
+    global KB_ROOT, PROCESSED_DIR, DOCUMENTS_FILE, CHUNKS_FILE, INDEX_DIR, FAISS_INDEX
+    global METADATA_FILE, METADATA_JSON, EMBEDDING_CACHE_FILE, STATE_DIR, PEOPLE_FILE
+    global KB_MANIFEST_FILE
+    KB_ROOT = Path(root)
+    PROCESSED_DIR = KB_ROOT / "processed"
+    DOCUMENTS_FILE = PROCESSED_DIR / "documents.jsonl"   # unified docs used to build the index
+    CHUNKS_FILE = PROCESSED_DIR / "chunks.jsonl"
+    PEOPLE_FILE = PROCESSED_DIR / "people.json"          # author/person relationship graph
+    INDEX_DIR = KB_ROOT / "index"
+    FAISS_INDEX = INDEX_DIR / "faiss.index"
+    METADATA_JSON = INDEX_DIR / "metadata.json"
+    METADATA_FILE = INDEX_DIR / "metadata.pkl"            # legacy; never loaded by default
+    EMBEDDING_CACHE_FILE = INDEX_DIR / "embedding_cache.npz"
+    STATE_DIR = KB_ROOT / "state"                         # incremental crawl state
+    KB_MANIFEST_FILE = KB_ROOT / "kb_manifest.json"       # version + counts of this KB
+    return KB_ROOT
+
+
+RELEASES_DIR = DATA_DIR / "releases"
+CURRENT_POINTER = RELEASES_DIR / "CURRENT"   # one line: the active release dir name
+
+
+def resolve_active_kb_root() -> Path:
+    """
+    The KB root the application serves:
+      1. KB_ROOT env var (explicit override), else
+      2. data/releases/<name in CURRENT> (versioned releases, atomic promotion), else
+      3. DATA_DIR (legacy flat layout: data/processed + data/index).
+    """
+    env = os.getenv("KB_ROOT")
+    if env:
+        return Path(env)
+    try:
+        name = CURRENT_POINTER.read_text(encoding="utf-8").strip()
+        if name and (RELEASES_DIR / name / "index" / "faiss.index").exists():
+            return RELEASES_DIR / name
+    except OSError:
+        pass
+    return DATA_DIR
+
+
+use_kb_root(resolve_active_kb_root())
+
 SCRAPE_LOG      = LOGS_DIR / "scrape.log"
 FAILED_CSV      = LOGS_DIR / "failed_urls.csv"
+
+# Legacy pickle metadata is only read when explicitly allowed (pickle can execute
+# code if the file is tampered with; JSON cannot).
+ALLOW_PICKLE_METADATA = os.getenv("ALLOW_PICKLE_METADATA", "false").lower() in ("1", "true", "yes")
 
 # ── Commit KB (primary source) ──────────────────────────────────────────────────
 # Raw crawl output (produced by scripts/scrape_commit_kb.py)
@@ -53,6 +114,14 @@ WEBSITE_METADATA  = KB_DIR / "takshashila_website_metadata.json"
 LOCAL_DOCUMENTS_FILE = KB_DIR / "local_documents.jsonl"        # secondary
 STAFF_HANDBOOK_FILE  = KB_DIR / "takshashila_staff_handbook.jsonl"  # optional supporting
 
+# Curated internal files folded into every index build (src/supplementary.py).
+# (file, source key). Missing files are skipped and reported, never an error.
+SUPPLEMENTARY_KB_FILES = [
+    (KB_DIR / "holiday_list_2026.jsonl", "local"),
+    (LOCAL_DOCUMENTS_FILE, "local"),
+    (STAFF_HANDBOOK_FILE, "staff_handbook"),
+]
+
 # ── Commit KB crawl settings (read from .env; never hardcode credentials) ────────
 COMMIT_KB_URL      = os.getenv("COMMIT_KB_URL", "https://commit.takshashila.org.in/")
 COMMIT_KB_USERNAME = os.getenv("COMMIT_KB_USERNAME", "")
@@ -68,15 +137,17 @@ RSS_FEEDS = [
     "https://takshashila.org.in/category/blogs/feed/",
 ]
 
-USER_AGENT = (
-    "TakshashilaRAG-Research-Bot/1.0 "
-    "(Academic research tool; contact: research@example.com)"
+USER_AGENT = os.getenv(
+    "CRAWLER_USER_AGENT",
+    "TakshashilaKnowledgeAssistant/2.0 (+https://takshashila.org.in/; internal knowledge-base crawler)",
 )
 
 # ── Scraper ────────────────────────────────────────────────────────────────────
 SCRAPE_DELAY       = float(os.getenv("SCRAPE_DELAY", "1.0"))
 SCRAPE_TIMEOUT     = int(os.getenv("SCRAPE_TIMEOUT", "30"))
 SCRAPE_MAX_RETRIES = int(os.getenv("SCRAPE_MAX_RETRIES", "3"))
+# Global politeness cap shared by all crawler threads (requests per second).
+SCRAPE_MAX_RPS     = float(os.getenv("SCRAPE_MAX_RPS", "4"))
 
 # ── Public website — full-site discovery (sitemap + listings + crawl fallback) ──
 WEBSITE_BASE_URL = os.getenv("WEBSITE_BASE_URL", "https://takshashila.org.in/").rstrip("/") + "/"
@@ -90,11 +161,16 @@ WEBSITE_SITEMAP_URLS = [
     "https://takshashila.org.in/wp-sitemap.xml",
 ]
 
+# Publisher recorded on first-party documents (website, Commit KB, curated files).
+ORG_NAME = os.getenv("ORG_NAME", "Takshashila Institution")
+
 # Known listing pages to paginate (beyond publications/blogs), tried politely —
 # a 404 on any of these is skipped silently, so it's safe to over-list here.
 WEBSITE_LISTING_URLS = [
     ("https://takshashila.org.in/pages/publications/", "publication"),
     ("https://takshashila.org.in/pages/blogs/", "blog"),
+    ("https://takshashila.org.in/pages/news/", "op-ed"),
+    ("https://takshashila.org.in/pages/team/", "people"),
     ("https://takshashila.org.in/research/", "research"),
     ("https://takshashila.org.in/commentary/", "commentary"),
     ("https://takshashila.org.in/reports/", "report"),
@@ -128,7 +204,9 @@ WEBSITE_INCLUDE_PATH_PATTERNS = [
 WEBSITE_FOLLOW_EXCLUDE_PATTERNS = [
     "/wp-admin/", "/wp-login", "/wp-json/", "/xmlrpc.php",
     "/cart/", "/checkout/", "/my-account/", "/logout", "/register",
-    "mailto:", "tel:", "javascript:", "#", "?share=", "?replytocom=",
+    # (fragments are stripped by canonicalize_url, so "#" links now resolve to
+    #  their page instead of being refused outright)
+    "?share=", "?replytocom=",
     "/comments/feed/", "/trackback/",
 ]
 
@@ -140,6 +218,12 @@ WEBSITE_DOC_EXCLUDE_PATTERNS = [
     "/tag/", "/tags/", "/category/", "/categories/", "/author/", "/authors/",
     "/search", "/page/", "/feed/", "/wp-json/", "/wp-admin/",
 ]
+
+# Listing pages whose entries are ingested one-by-one as "op-ed" reference
+# documents (title, authors, outlet, date, external URL). /pages/news/ lists the
+# op-eds and media pieces Takshashila staff publish in external outlets.
+WEBSITE_OPED_LISTING_PATHS = [p.strip() for p in os.getenv(
+    "WEBSITE_OPED_LISTING_PATHS", "/pages/news/").split(",") if p.strip()]
 
 # Back-compat alias (older code referenced WEBSITE_EXCLUDE_PATH_PATTERNS).
 WEBSITE_EXCLUDE_PATH_PATTERNS = WEBSITE_DOC_EXCLUDE_PATTERNS
@@ -184,13 +268,15 @@ CHUNK_MIN_LEN = int(os.getenv("CHUNK_MIN_LEN", "60"))    # drop tiny fragments
 
 # ── Groq ───────────────────────────────────────────────────────────────────────
 GROQ_API_KEY  = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL    = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL    = os.getenv("GROQ_MODEL") or "openai/gpt-oss-120b"
 
+# Models verified as available on the organisation's Groq account (2026-09-23).
+# llama-3.3-70b-versatile / llama-3.1-8b-instant / mixtral / gemma2 are retired
+# and return NotFoundError.
 AVAILABLE_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "mixtral-8x7b-32768",
-    "gemma2-9b-it",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b",
 ]
 
 # ── RAG retrieval ────────────────────────────────────────────────────────────────
@@ -222,7 +308,8 @@ GROUNDING_MIN_OVERLAP = float(os.getenv("GROUNDING_MIN_OVERLAP", "0.18"))
 SOURCE_PRIORITY = {
     "commit_kb":      3,   # primary, living knowledge base
     "staff_handbook": 2,   # secondary supporting source
-    "website":        2,   # public Takshashila website (publications + blogs)
+    "website":        2,   # public Takshashila website (all first-party content)
+    "local":          2,   # curated internal files (holiday list, …)
 }
 DEFAULT_SOURCE_PRIORITY = 1   # everything else (pdfs, local, legacy)
 
@@ -252,27 +339,83 @@ def source_display_name(source: str, fallback: str = "") -> str:
     return SOURCE_DISPLAY_NAMES.get((source or "").lower(), fallback or source or "Source")
 
 
-# ── Automated refresh schedule (scripts/scheduler.py) ───────────────────────────
-# The knowledge base refreshes itself on a weekly cron. Defaults to every
-# Tuesday at 09:00 India time. All four are overridable from .env.
-#   SCHEDULE_DAY       cron day_of_week: mon,tue,wed,thu,fri,sat,sun (or 0-6)
-#   SCHEDULE_HOUR      0-23   (local to SCHEDULE_TIMEZONE)
-#   SCHEDULE_MINUTE    0-59
-#   SCHEDULE_TIMEZONE  IANA tz name, e.g. Asia/Kolkata
-SCHEDULE_DAY       = os.getenv("SCHEDULE_DAY", "tue")
-SCHEDULE_HOUR      = int(os.getenv("SCHEDULE_HOUR", "9"))
-SCHEDULE_MINUTE    = int(os.getenv("SCHEDULE_MINUTE", "0"))
-SCHEDULE_TIMEZONE  = os.getenv("SCHEDULE_TIMEZONE", "Asia/Kolkata")
+# ── Automated daily refresh (scripts/refresh_kb.py) ────────────────────────────
+# Default production schedule: every day at 06:00 Asia/Kolkata. The time is ALWAYS
+# interpreted in KB_REFRESH_TIMEZONE (never UTC). Used by the GitHub Actions gate
+# (scripts/refresh_gate.py) and the optional self-hosted APScheduler runner.
+KB_REFRESH_ENABLED  = os.getenv("KB_REFRESH_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+KB_REFRESH_TIME     = os.getenv("KB_REFRESH_TIME", "06:00")
+KB_REFRESH_TIMEZONE = os.getenv("KB_REFRESH_TIMEZONE", os.getenv("SCHEDULE_TIMEZONE", "Asia/Kolkata"))
+# Consecutive failed refreshes after which refresh health is reported "degraded".
+KB_REFRESH_DEGRADED_AFTER = int(os.getenv("KB_REFRESH_DEGRADED_AFTER", "3"))
+# Safety valve: never apply removals if more than this fraction of fetches failed.
+KB_MAX_FAILURE_RATIO = float(os.getenv("KB_MAX_FAILURE_RATIO", "0.2"))
+# A URL must be missing (404/410 or unlinked) on this many consecutive complete
+# crawls before its document is removed — a single bad day never deletes knowledge.
+KB_REMOVAL_CONFIRMATIONS = int(os.getenv("KB_REMOVAL_CONFIRMATIONS", "2"))
 
-# Scheduler bookkeeping files.
+
+def refresh_hour_minute():
+    hh, _, mm = (KB_REFRESH_TIME or "06:00").partition(":")
+    return int(hh), int(mm or 0)
+
+
+# Back-compat names used by scripts/scheduler.py
+SCHEDULE_DAY       = os.getenv("SCHEDULE_DAY", "*")
+SCHEDULE_HOUR, SCHEDULE_MINUTE = refresh_hour_minute()
+SCHEDULE_TIMEZONE  = KB_REFRESH_TIMEZONE
+
+# Refresh bookkeeping.
 SCHEDULER_LOG      = LOGS_DIR / "scheduler.log"
 SCHEDULER_LOCK     = LOGS_DIR / "scheduler.lock"        # single-instance guard
 SCHEDULER_STATUS   = LOGS_DIR / "scheduler_status.json" # last-run result, for the UI
+DAILY_REPORTS_DIR  = REPORTS_DIR / "daily_refresh"
+
+# ── Distribution of the built KB to the API (see src/kb_bundle.py, src/kb_sync.py) ──
+KB_BUNDLE_MANIFEST_URL = os.getenv("KB_BUNDLE_MANIFEST_URL", "")
+KB_BUNDLE_KEY          = os.getenv("KB_BUNDLE_KEY", "")          # Fernet key; never commit
+KB_BUNDLE_TOKEN        = os.getenv("KB_BUNDLE_TOKEN", "")        # optional GitHub token
+KB_SYNC_INTERVAL_MINUTES = int(os.getenv("KB_SYNC_INTERVAL_MINUTES", "30"))
+
+
+# ── Production API (api/main.py) ─────────────────────────────────────────────────
+def _csv(name: str, default: str = "") -> list:
+    return [x.strip() for x in os.getenv(name, default).split(",") if x.strip()]
+
+
+# Browser origins allowed to call the API (e.g. https://<user>.github.io). Empty = none.
+def _origin(value: str) -> str:
+    """
+    Reduce a URL to a CORS origin (scheme://host[:port]). Browsers send the Origin
+    header without a path, so a project-Pages URL such as
+    https://user.github.io/Repo-Name/ must be allowed as https://user.github.io.
+    """
+    from urllib.parse import urlsplit
+    v = value.strip()
+    if v == "*":
+        return v
+    parts = urlsplit(v)
+    return f"{parts.scheme.lower()}://{parts.netloc.lower()}" if parts.scheme and parts.netloc else v.rstrip("/")
+
+
+CORS_ALLOW_ORIGINS = list(dict.fromkeys(_origin(o) for o in _csv("CORS_ALLOW_ORIGINS")))
+# Bearer tokens that unlock INTERNAL sources (Commit KB, local files) on the API.
+# Without a valid token the API answers only from PUBLIC_SOURCES.
+API_ACCESS_TOKENS  = _csv("API_ACCESS_TOKENS")
+PUBLIC_SOURCES     = _csv("PUBLIC_SOURCES", "website")
+INTERNAL_SOURCES   = _csv("INTERNAL_SOURCES", "commit_kb,website,local,staff_handbook")
+API_RATE_LIMIT_PER_MINUTE = int(os.getenv("API_RATE_LIMIT_PER_MINUTE", "30"))
+API_QUERY_TIMEOUT_SECONDS = float(os.getenv("API_QUERY_TIMEOUT_SECONDS", "60"))
+GROQ_TIMEOUT_SECONDS      = float(os.getenv("GROQ_TIMEOUT_SECONDS", "45"))
+# Streamlit admin tab password (Build & Update / Automation). Empty = admin hidden.
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+# Log raw query text? Off by default (queries can contain sensitive content).
+LOG_QUERY_TEXT = os.getenv("LOG_QUERY_TEXT", "false").lower() in ("1", "true", "yes")
 
 
 # ── Ensure dirs exist ──────────────────────────────────────────────────────────
 def ensure_dirs():
-    for d in [RAW_HTML_DIR, RAW_PDF_DIR, PROCESSED_DIR, INDEX_DIR, LOGS_DIR, KB_DIR]:
+    for d in [LOGS_DIR, REPORTS_DIR, KB_DIR, PROCESSED_DIR, INDEX_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
 ensure_dirs()

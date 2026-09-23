@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from integrations.command_parser import (  # noqa: E402
-    Destination, autocomplete_spec, build_destination, dequote, parse_command,
+    autocomplete_spec, build_destination, dequote, parse_command,
 )
 
 

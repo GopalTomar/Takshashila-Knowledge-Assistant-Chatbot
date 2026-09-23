@@ -39,11 +39,11 @@ import time
 import traceback
 from collections import OrderedDict
 from logging.handlers import RotatingFileHandler
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, Form, HTTPException
+from fastapi import APIRouter, BackgroundTasks, FastAPI, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 load_dotenv()
@@ -138,10 +138,58 @@ ENABLE_VOICE = bool(PUBLIC_BASE_URL) and os.getenv(
 ).lower() in ("1", "true", "yes", "on")
 VOICE_TTL = int(os.getenv("MATTERMOST_VOICE_TTL_SECONDS", "1800"))  # link validity
 _VOICE_SECRET = (
-    os.getenv("MATTERMOST_VOICE_SECRET", "")
-    or MATTERMOST_SLASH_TOKEN
-    or "takshashila-voice-fallback-secret"
+    os.getenv("MATTERMOST_VOICE_SECRET", "") or MATTERMOST_SLASH_TOKEN
 ).encode("utf-8")
+if not _VOICE_SECRET:
+    ENABLE_VOICE = False           # never sign links with a guessable key
+
+# Interactive-button contexts and dialog state are HMAC-signed with this key so
+# /mattermost/action and /mattermost/dialog reject anything the bot didn't issue
+# (those endpoints are public URLs and Mattermost does not sign callbacks).
+_ACTION_SECRET = (
+    os.getenv("MATTERMOST_ACTION_SECRET", "") or MATTERMOST_SLASH_TOKEN or MATTERMOST_BOT_TOKEN
+).encode("utf-8")
+
+
+def _sign_payload(data: dict) -> str:
+    body = json.dumps({k: v for k, v in data.items() if k != "sig"}, sort_keys=True,
+                      ensure_ascii=False, separators=(",", ":"))
+    return hmac.new(_ACTION_SECRET, body.encode("utf-8"), hashlib.sha256).hexdigest()[:40]
+
+
+def _bind_props(props: Optional[dict], channel_id: str) -> Optional[dict]:
+    """
+    Stamp every button context in ``props`` with the channel the post will live in
+    and re-sign it. /mattermost/action then rejects a context whose channel differs
+    from the channel Mattermost reports for the click, so a signed context copied
+    from one channel can never be replayed to post internal content elsewhere.
+    """
+    if not props or not channel_id:
+        return props
+    for att in props.get("attachments") or []:
+        for act in att.get("actions") or []:
+            ctx = (act.get("integration") or {}).get("context")
+            if isinstance(ctx, dict):
+                ctx["cid"] = channel_id
+                ctx["sig"] = _sign_payload(ctx)
+    return props
+
+
+def _guest_free_channel(channel_id: str) -> bool:
+    """True when internal content may be posted visibly in ``channel_id``."""
+    if not BLOCK_GUESTS:
+        return True
+    if not mattermost_api.is_configured():
+        return False
+    guests = mattermost_api.channel_guest_count(channel_id)
+    return guests == 0
+
+
+def _verify_payload(data: dict) -> bool:
+    if not _ACTION_SECRET or not isinstance(data, dict):
+        return False
+    sig = str(data.get("sig") or "")
+    return bool(sig) and hmac.compare_digest(sig, _sign_payload(data))
 
 
 def _csv_set(raw: str) -> set:
@@ -173,6 +221,12 @@ PROGRESS_STAGES_SEARCH = [
 
 
 ALLOWED_TEAM_IDS = _csv_set(os.getenv("MATTERMOST_ALLOWED_TEAM_IDS", ""))
+
+# Guest accounts (external collaborators) must never receive internal Commit KB
+# answers — neither by asking nor as the recipient of a shared answer, and no
+# answer may be posted into a channel that contains guests. Requires the bot token
+# (roles are looked up via the Mattermost API).
+BLOCK_GUESTS = os.getenv("MATTERMOST_BLOCK_GUESTS", "true").lower() in ("1", "true", "yes", "on")
 ALLOWED_CHANNEL_IDS = _csv_set(os.getenv("MATTERMOST_ALLOWED_CHANNEL_IDS", ""))
 
 # ── Enterprise routing (--user / --channel / --group destinations) ───────────────
@@ -209,7 +263,7 @@ DIALOG_URL = f"{PUBLIC_BASE_URL}/mattermost/dialog" if PUBLIC_BASE_URL else ""
 # already a project dependency) and uploads it — no second RAG run. Requires the
 # bot token (to upload the file) and pymupdf to be importable.
 try:
-    import fitz as _fitz  # PyMuPDF
+    import pymupdf as _fitz  # PyMuPDF
     _HAVE_PYMUPDF = True
 except Exception:  # pragma: no cover - pymupdf is a listed dependency
     _fitz = None
@@ -368,6 +422,7 @@ def _action(name: str, action: str, **context) -> dict:
     """One interactive button that calls back to /mattermost/action."""
     ctx = {"action": action}
     ctx.update(context)
+    ctx["sig"] = _sign_payload(ctx)
     return {"name": name, "integration": {"url": ACTION_URL, "context": ctx}}
 
 
@@ -534,6 +589,7 @@ def post_to_channel(channel_id: str, message: str, response_url: Optional[str],
     (only available for slash commands) can also carry attachments, but voice
     answers have no response_url, so for them the bot token is mandatory.
     """
+    props = _bind_props(props, channel_id)
     n_groups = len((props or {}).get("attachments", []) or [])
 
     if MATTERMOST_BOT_TOKEN and MATTERMOST_URL and channel_id:
@@ -618,19 +674,6 @@ def _patch_post(post_id: str, message: str, props: Optional[dict] = None) -> boo
     return False
 
 
-def _delete_post(post_id: str) -> bool:
-    """Delete a bot post (used to clean up a status message on fallback)."""
-    if not (MATTERMOST_BOT_TOKEN and MATTERMOST_URL and post_id):
-        return False
-    try:
-        with httpx.Client(timeout=20.0) as client:
-            resp = client.delete(f"{MATTERMOST_URL}/api/v4/posts/{post_id}",
-                                 headers={"Authorization": f"Bearer {MATTERMOST_BOT_TOKEN}"})
-        return resp.status_code in (200, 201)
-    except Exception:
-        return False
-
-
 class _ProgressIndicator:
     """
     A single status post that animates through ``stages`` while RAG runs, then is
@@ -679,7 +722,7 @@ class _ProgressIndicator:
             self._thread.join(timeout=PROGRESS_INTERVAL + 1.0)
         # props=None would leave the status post with no attachments; pass {} to
         # explicitly clear, or the real button attachments when present.
-        patch_props = props if props is not None else {}
+        patch_props = _bind_props(props, self.channel_id) if props is not None else {}
         if self.post_id and _patch_post(self.post_id, message, patch_props):
             return self.post_id
         # Patch failed → fall back to a fresh post so the answer is never lost.
@@ -760,7 +803,7 @@ def _delete_post(post_id: str) -> bool:
 
 
 def _post_ephemeral_via_url(response_url: str, message: str,
-                            props: Optional[dict] = None) -> bool:
+                            props: Optional[dict] = None, channel_id: str = "") -> bool:
     """
     Deliver an answer visible ONLY to the requesting user, in-channel, using the
     slash command's response_url. This is how private mode keeps a shared channel
@@ -768,6 +811,7 @@ def _post_ephemeral_via_url(response_url: str, message: str,
     """
     if not response_url:
         return False
+    props = _bind_props(props, channel_id)
     n_groups = len((props or {}).get("attachments", []) or [])
     body = {"response_type": "ephemeral", "text": message}
     if props and props.get("attachments"):
@@ -923,6 +967,7 @@ def run_rag_and_reply(
             result = rag_answer(
                 query=question, top_k=RAG_TOP_K, model=GROQ_MODEL,
                 temperature=RAG_TEMPERATURE, source=None, category=None, use_hybrid=True,
+                allowed_sources=config.INTERNAL_SOURCES,
                 mode=mode,
             )
             confidence = result.get("confidence", "none")
@@ -984,7 +1029,7 @@ def run_rag_and_reply(
             props = None
             if ENABLE_BUTTONS and has_answer:
                 props = {"attachments": [_feedback_group(question)]}
-            _post_ephemeral_via_url(response_url, message, props)
+            _post_ephemeral_via_url(response_url, message, props, channel_id=channel_id)
             return
 
         # ── Full post (channel for public, DM for private) with all buttons ───
@@ -1048,6 +1093,7 @@ def _regen_for_callback(question: str) -> dict:
     return rag_answer(
         query=question, top_k=RAG_TOP_K, model=GROQ_MODEL,
         temperature=RAG_TEMPERATURE, source=None, category=None, use_hybrid=True,
+                allowed_sources=config.INTERNAL_SOURCES,
     )
 
 
@@ -1335,11 +1381,11 @@ _VOICE_PAGE = """<!doctype html>
 #  FastAPI app
 # ════════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="Takshashila Mattermost RAG Bot", version="2.0.0")
+router = APIRouter()
 
 
-@app.on_event("startup")
-def _startup() -> None:
+def mattermost_startup(warm: bool = True) -> None:
+    """Startup checks (called by the unified API and by the legacy standalone app)."""
     if not MATTERMOST_SLASH_TOKEN:
         logger.warning("MATTERMOST_SLASH_TOKEN is not set — every slash request will be rejected (403).")
     if not MATTERMOST_BOT_TOKEN:
@@ -1354,7 +1400,7 @@ def _startup() -> None:
         f"group destinations = {ENABLE_GROUP_DESTINATION}; "
         f"share buttons = {ENABLE_SHARE_BUTTONS}; pdf export = {ENABLE_PDF_EXPORT}."
     )
-    if WARM_RAG_ON_STARTUP:
+    if warm and WARM_RAG_ON_STARTUP:
         try:
             warm_rag_resources()
         except Exception as exc:
@@ -1374,7 +1420,7 @@ def _ephemeral_dismissable(text: str) -> JSONResponse:
     """
     body = {"response_type": "ephemeral", "text": text}
     if ACTION_URL:
-        body["attachments"] = [{"actions": [_action("🗑️ Dismiss", "dismiss")]}]
+        body["attachments"] = [{"actions": [_action("🗑️ Dismiss", "dismiss")]}]   # harmless: unbound
     return JSONResponse(body)
 
 
@@ -1392,12 +1438,12 @@ def _routing_ack(destination: "command_parser.Destination") -> str:
     return "Working on it — I'll deliver the answer and confirm here."
 
 
-@app.get("/health")
+@router.get("/mattermost/health")
 def health() -> dict:
     return {"status": "ok", "service": "takshashila-mattermost-rag-bot"}
 
 
-@app.post("/mattermost/ask")
+@router.post("/mattermost/ask")
 async def mattermost_ask(
     background_tasks: BackgroundTasks,
     token: str = Form(""),
@@ -1411,7 +1457,8 @@ async def mattermost_ask(
     response_url: str = Form(""),
 ):
     """Handle the /askkb slash command."""
-    if not MATTERMOST_SLASH_TOKEN or token != MATTERMOST_SLASH_TOKEN:
+    if not MATTERMOST_SLASH_TOKEN or not hmac.compare_digest(
+            (token or "").encode("utf-8"), MATTERMOST_SLASH_TOKEN.encode("utf-8")):
         logger.warning(f"Rejected slash request: invalid token (user_name={user_name!r}).")
         raise HTTPException(status_code=403, detail="Invalid slash command token.")
 
@@ -1421,6 +1468,15 @@ async def mattermost_ask(
         return _ephemeral("This command is not enabled for this channel.")
 
     raw_text = (text or "").strip()
+
+    if BLOCK_GUESTS:
+        # Fail closed: without the bot token roles can't be checked.
+        guest = mattermost_api.is_guest(user_id) if mattermost_api.is_configured() else None
+        if guest is None:
+            return _ephemeral("I couldn't verify your account right now. Please try again in a moment.")
+        if guest:
+            logger.info("Rejected /askkb from a guest account.")
+            return _ephemeral("The Takshashila Knowledge Assistant is available to staff accounts only.")
 
     # ── Parse into ONE normalized command object ────────────────────────────────
     # command_parser handles long flags + short aliases (-m/-u/-c/-g, -s/-d/-f/-v)
@@ -1502,6 +1558,12 @@ async def mattermost_ask(
         )
         return _ephemeral("🔎 " + _routing_ack(destination))
 
+    # Never post an internal answer publicly into a channel that has guest accounts
+    # (or whose membership can't be checked) — deliver it privately instead.
+    if visibility == "public" and not _guest_free_channel(channel_id):
+        logger.info("Public answer downgraded to private: channel has guests or is unverifiable.")
+        visibility = "private"
+
     background_tasks.add_task(
         run_rag_and_reply,
         question=question, channel_id=channel_id, response_url=response_url or None,
@@ -1521,13 +1583,13 @@ async def mattermost_ask(
     return _ephemeral(ACK_SEARCH if mode == "search" else ACK_MESSAGE)
 
 
-@app.get("/voice")
+@router.get("/voice")
 def voice_page() -> HTMLResponse:
     """Serve the in-browser voice recorder page."""
     return HTMLResponse(content=_VOICE_PAGE)
 
 
-@app.post("/mattermost/voice-ask")
+@router.post("/mattermost/voice-ask")
 async def voice_ask(background_tasks: BackgroundTasks, payload: dict):
     """Accept a transcribed question from the voice page and answer the asker."""
     channel_id = (payload.get("channel_id") or "").strip()
@@ -1551,12 +1613,15 @@ async def voice_ask(background_tasks: BackgroundTasks, payload: dict):
     mode, q = formatting.parse_mode(question)
     # Private voice answers are DM'd to the asker (there's no response_url for an
     # ephemeral reply); public voice answers go to the channel.
-    dm_user_id = user_id if ANSWER_VISIBILITY == "private" else ""
+    visibility = ANSWER_VISIBILITY
+    if visibility == "public" and not _guest_free_channel(channel_id):
+        visibility = "private"                      # never public where guests can read
+    dm_user_id = user_id if visibility == "private" else ""
     background_tasks.add_task(
         run_rag_and_reply,
         question=q, channel_id=channel_id, response_url=None,
         user_name="voice", user_id=user_id, channel_name="", mode=mode, voice=True,
-        visibility=ANSWER_VISIBILITY, dm_user_id=dm_user_id,
+        visibility=visibility, dm_user_id=dm_user_id,
     )
     logger.info(f"voice_question_received  channel={channel_id!r}  user={user_id!r}  "
                 f"mode={mode}  visibility={ANSWER_VISIBILITY}  question={q!r}")
@@ -1598,7 +1663,8 @@ def _handle_feedback(payload: dict, context: dict) -> JSONResponse:
             + _manage_tail(cached["question"])
         )
         return JSONResponse({
-            "update": {"message": cached["message"], "props": {"attachments": attachments}},
+            "update": {"message": cached["message"],
+                       "props": _bind_props({"attachments": attachments}, payload.get("channel_id", ""))},
             "ephemeral_text": popup,
         })
     # Cache miss (e.g. after a restart): still give the clicker the popup.
@@ -1637,6 +1703,12 @@ _SHARE_DIALOG = {
 }
 
 
+def _signed_state(state: dict) -> dict:
+    state = dict(state)
+    state["sig"] = _sign_payload(state)
+    return state
+
+
 def _handle_share_button(action: str, payload: dict, question: str,
                          post_id: str) -> JSONResponse:
     """Open a Mattermost dialog collecting the share target (no RAG re-run)."""
@@ -1656,7 +1728,8 @@ def _handle_share_button(action: str, payload: dict, question: str,
         "submit_label": "Share",
         "elements": [spec["element"]],
         # Carry the post id (to reuse the cached answer) + a fallback question.
-        "state": json.dumps({"p": post_id, "q": (question or "")[:400]}),
+        "state": json.dumps(_signed_state({"p": post_id, "q": (question or "")[:400],
+                                           "c": payload.get("channel_id", "")})),
     }
     if not mattermost_api.open_dialog(trigger_id, DIALOG_URL, dialog):
         return JSONResponse({"ephemeral_text": "Couldn't open the share dialog. Please try again."})
@@ -1696,16 +1769,33 @@ def _deliver_cached_answer(destination: "command_parser.Destination", post_id: s
     )
 
 
-@app.post("/mattermost/action")
+@router.post("/mattermost/action")
 async def mattermost_action(background_tasks: BackgroundTasks, payload: dict):
     """Route interactive-button clicks (follow-ups, export, share, feedback)."""
     context = payload.get("context") or {}
+    if not _verify_payload(context):
+        logger.warning("Rejected /mattermost/action with missing or invalid signature.")
+        raise HTTPException(status_code=403, detail="Invalid action signature.")
     action = (context.get("action") or "").strip()
     question = (context.get("question") or "").strip()
     channel_id = payload.get("channel_id", "")
     post_id = payload.get("post_id", "")
+    # Every action except the harmless ones must come from the channel its signed
+    # context was issued for (see _bind_props).
+    if action not in ("feedback", "dismiss") and context.get("cid") != channel_id:
+        logger.warning("Rejected /mattermost/action: context not bound to this channel.")
+        raise HTTPException(status_code=403, detail="Action not valid for this channel.")
     user_id = payload.get("user_id", "")
     user_name = payload.get("user_name", "")
+    if (action not in ("feedback", "dismiss") and BLOCK_GUESTS
+            and (not mattermost_api.is_configured() or mattermost_api.is_guest(user_id) is not False)):
+        return JSONResponse({"ephemeral_text": "This action is available to staff accounts only."})
+
+    # Actions that post a visible message/file into the channel (exports, related
+    # documents) are refused where guests could see it.
+    if action in ("export_markdown", "export_pdf", "related") and not _guest_free_channel(channel_id):
+        return JSONResponse({"ephemeral_text": "This channel includes guest accounts, so internal "
+                                               "content can't be posted here."})
 
     # ── Feedback (👍 / 👎) — interactive transition ─────────────────────────────
     if action == "feedback":
@@ -1755,6 +1845,13 @@ async def mattermost_action(background_tasks: BackgroundTasks, payload: dict):
         )
         return JSONResponse({"ephemeral_text": "📖 Fetching more details…"})
 
+    # Destructive actions must refer to a real post in the claimed channel.
+    if action in ("delete_one", "delete_all", "delete_all_confirm") and MATTERMOST_BOT_TOKEN:
+        post = mattermost_api.get_post(post_id)
+        if not post or post.get("channel_id") != channel_id:
+            logger.warning("Rejected delete action: post/channel mismatch.")
+            return JSONResponse({"ephemeral_text": "This action is not valid for this channel."})
+
     # ── Delete this single response ─────────────────────────────────────────────
     if action == "delete_one":
         if not (MATTERMOST_BOT_TOKEN and MATTERMOST_URL):
@@ -1776,7 +1873,8 @@ async def mattermost_action(background_tasks: BackgroundTasks, payload: dict):
                 + [_feedback_group(cached["question"]), _confirm_delete_group(cached["question"])]
             )
             return JSONResponse({
-                "update": {"message": cached["message"], "props": {"attachments": attachments}},
+                "update": {"message": cached["message"],
+                       "props": _bind_props({"attachments": attachments}, payload.get("channel_id", ""))},
                 "ephemeral_text": "⚠️ Please confirm: this will remove every bot response in this channel.",
             })
         # No cached post to transform → fall back to deleting immediately.
@@ -1796,7 +1894,8 @@ async def mattermost_action(background_tasks: BackgroundTasks, payload: dict):
         if cached:
             return JSONResponse({
                 "update": {"message": cached["message"],
-                           "props": {"attachments": _answer_attachments(cached["question"])}},
+                           "props": _bind_props({"attachments": _answer_attachments(cached["question"])},
+                                               payload.get("channel_id", ""))},
                 "ephemeral_text": "✖️ Deletion cancelled.",
             })
         return JSONResponse({"ephemeral_text": "✖️ Deletion cancelled."})
@@ -1804,13 +1903,16 @@ async def mattermost_action(background_tasks: BackgroundTasks, payload: dict):
     return JSONResponse({"ephemeral_text": "Unknown action."})
 
 
-@app.post("/mattermost/feedback")
+@router.post("/mattermost/feedback")
 async def mattermost_feedback(payload: dict):
     """Legacy feedback route — kept so older posts' buttons keep working."""
-    return _handle_feedback(payload, payload.get("context") or {})
+    ctx = payload.get("context") or {}
+    if not _verify_payload(ctx):
+        raise HTTPException(status_code=403, detail="Invalid action signature.")
+    return _handle_feedback(payload, ctx)
 
 
-@app.post("/mattermost/dialog")
+@router.post("/mattermost/dialog")
 async def mattermost_dialog(payload: dict):
     """
     Handle a Share-dialog submission: reuse the already-generated answer and
@@ -1838,6 +1940,9 @@ async def mattermost_dialog(payload: dict):
         state = json.loads(payload.get("state") or "{}")
     except Exception:
         state = {}
+    if not _verify_payload(state) or state.get("c") != payload.get("channel_id", ""):
+        logger.warning("Rejected /mattermost/dialog with invalid state signature.")
+        return JSONResponse({"errors": {"target": "This share dialog has expired. Please try again."}})
     post_id = state.get("p", "")
     question = state.get("q", "")
 
@@ -1859,6 +1964,23 @@ async def mattermost_dialog(payload: dict):
         mattermost_api.post_ephemeral(channel_id, user_id, delivery.confirmation)
     logger.info(f"shared via dialog  kind={kind}  target={target!r}  post_id={delivery.post_id!r}")
     return JSONResponse({})
+
+
+# ── Legacy standalone app (uvicorn integrations.mattermost_bot:app) ────────────
+# Production serves these routes from the unified API (api/main.py). This app is
+# kept so existing local run instructions keep working.
+app = FastAPI(title="Takshashila Mattermost RAG Bot", version="3.0.0")
+app.include_router(router)
+
+
+@app.get("/health")
+def legacy_health() -> dict:
+    return {"status": "ok", "service": "takshashila-mattermost-rag-bot"}
+
+
+@app.on_event("startup")
+def _legacy_startup() -> None:
+    mattermost_startup()
 
 
 # Allow `python integrations/mattermost_bot.py` as a convenience (uvicorn preferred).

@@ -347,6 +347,88 @@ def _short(resp) -> str:
 #  Posting helpers used by the router / dialog flow
 # ════════════════════════════════════════════════════════════════════════════════
 
+_ROLE_CACHE: Dict[str, tuple] = {}
+_ROLE_TTL = 300.0
+
+
+def is_guest(user_id: str) -> Optional[bool]:
+    """
+    True if ``user_id`` is a Mattermost guest account, False if a regular user,
+    None if it could not be determined (callers must then fail closed).
+    """
+    import time as _t
+    if not (is_configured() and user_id):
+        return None
+    hit = _ROLE_CACHE.get(user_id)
+    if hit and _t.monotonic() - hit[1] < _ROLE_TTL:
+        return hit[0]
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            r = client.get(f"{MATTERMOST_URL}/api/v4/users/{user_id}", headers=_auth_headers())
+        if r.status_code != 200:
+            return None
+        guest = "system_guest" in (r.json().get("roles") or "").split()
+        _ROLE_CACHE[user_id] = (guest, _t.monotonic())
+        return guest
+    except Exception as exc:
+        logger.error(f"is_guest raised {type(exc).__name__}.")
+        return None
+
+
+def recipient_is_guest(user: Optional[Dict]) -> bool:
+    """Guest check for a resolved user object; unknown roles fail closed (True)."""
+    if not user:
+        return True
+    roles = user.get("roles")
+    if roles is None:
+        g = is_guest(user.get("id", ""))
+        return True if g is None else g
+    return "system_guest" in roles.split()
+
+
+def user_in_channel(channel_id: str, user_id: str) -> bool:
+    """True when ``user_id`` is a member of ``channel_id``."""
+    if not (is_configured() and channel_id and user_id):
+        return False
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            r = client.get(f"{MATTERMOST_URL}/api/v4/channels/{channel_id}/members/{user_id}",
+                           headers=_auth_headers())
+        return r.status_code == 200
+    except Exception as exc:
+        logger.error(f"user_in_channel raised {type(exc).__name__}.")
+        return False
+
+
+def channel_guest_count(channel_id: str) -> Optional[int]:
+    """Number of guest accounts in a channel (None if unknown → callers fail closed)."""
+    if not (is_configured() and channel_id):
+        return None
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            r = client.get(f"{MATTERMOST_URL}/api/v4/channels/{channel_id}/stats",
+                           headers=_auth_headers())
+        if r.status_code != 200:
+            return None
+        return int(r.json().get("guest_count", 0) or 0)
+    except Exception as exc:
+        logger.error(f"channel_guest_count raised {type(exc).__name__}.")
+        return None
+
+
+def get_post(post_id: str) -> Optional[Dict]:
+    """Fetch a post (used to verify a button click belongs to the claimed channel)."""
+    if not (is_configured() and post_id):
+        return None
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            r = client.get(f"{MATTERMOST_URL}/api/v4/posts/{post_id}", headers=_auth_headers())
+        return r.json() if r.status_code == 200 else None
+    except Exception as exc:
+        logger.error(f"get_post raised {type(exc).__name__}.")
+        return None
+
+
 def post_ephemeral(channel_id: str, user_id: str, message: str) -> bool:
     """
     Send a message visible only to ``user_id`` inside ``channel_id`` (used for

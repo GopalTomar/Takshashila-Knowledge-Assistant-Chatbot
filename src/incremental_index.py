@@ -22,16 +22,15 @@ that actually changed, so an incremental update stays fast end-to-end.
 from __future__ import annotations
 
 import json
-import pickle
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional
 
 from src import config
 from src.utils import get_logger, load_jsonl, save_jsonl
 
 logger = get_logger("incremental_index", config.SCRAPE_LOG)
 
-METADATA_JSON = config.INDEX_DIR / "metadata.json"
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -43,9 +42,13 @@ def _doc_key(doc: Dict) -> str:
 
 
 def _norm_url(u: str) -> str:
-    """Normalise a URL for identity comparison (case, trailing slash, fragment)."""
+    """Normalise a URL for identity comparison (same canonical form as the crawler)."""
     if not u:
         return ""
+    from src.url_utils import canonicalize_url
+    cu = canonicalize_url(u.strip())
+    if cu:
+        return cu.rstrip("/") or cu
     try:
         from urllib.parse import urlsplit, urlunsplit
         s = urlsplit(u.strip())
@@ -167,81 +170,117 @@ def merge_documents(new_or_changed: List[Dict],
 #  Cached index rebuild
 # ════════════════════════════════════════════════════════════════════════════════
 
-def rebuild_index(progress_cb=None, use_cache: bool = True) -> Dict[str, int]:
+_PIPELINE_MODULES = ("chunker.py", "metadata.py", "supplementary.py", "people.py", "utils.py",
+                     "url_utils.py")
+
+
+def pipeline_version() -> str:
     """
-    Re-chunk ``documents.jsonl`` and rebuild the FAISS index, embedding only
-    new/changed chunks when ``use_cache`` is on. Writes the same files as
-    ``vector_store.build_index``. Returns {documents, chunks, embedded, cached}.
+    Fingerprint of everything that turns documents into indexed chunks (processing
+    code, chunk parameters, embedding model). Stored in kb_manifest.json; when it
+    changes, the next refresh re-indexes even if no document changed, so a deployed
+    processing fix reaches production. Unchanged chunks still come from the cache.
+    """
+    import hashlib
+    h = hashlib.sha256()
+    src_dir = Path(__file__).resolve().parent
+    for name in _PIPELINE_MODULES:
+        h.update(name.encode())
+        h.update((src_dir / name).read_bytes().replace(b"\r\n", b"\n"))
+    h.update(f"{config.CHUNK_SIZE}|{config.CHUNK_OVERLAP}|{config.CHUNK_MIN_LEN}|"
+             f"{config.EMBEDDING_MODEL}".encode())
+    return h.hexdigest()[:16]
+
+
+def load_all_documents() -> List[Dict]:
+    """documents.jsonl + curated supplementary files, normalised to the schema."""
+    from src.metadata import normalize_document
+    from src.supplementary import load_supplementary_documents
+    crawled = load_jsonl(config.DOCUMENTS_FILE)
+    known_people = [d.get("title") for d in crawled if d.get("content_type") == "person"]
+    docs = [normalize_document(d, known_people) for d in crawled]
+    have = {d["document_id"] for d in docs}
+    docs += [normalize_document(d) for d in load_supplementary_documents() if d["document_id"] not in have]
+    return docs
+
+
+def write_kb_manifest(summary: Dict, version: Optional[str] = None) -> Dict:
+    """Version stamp of the KB root (read by the API's /health and kb_sync)."""
+    version = version or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    manifest = {"version": version, "built_at": datetime.now(timezone.utc).isoformat(), **summary}
+    config.KB_MANIFEST_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = config.KB_MANIFEST_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(config.KB_MANIFEST_FILE)
+    return manifest
+
+
+def rebuild_index(progress_cb=None, use_cache: bool = True, version: Optional[str] = None) -> Dict[str, int]:
+    """
+    Re-chunk all documents and rebuild FAISS for the ACTIVE KB root, embedding only
+    new/changed chunks (embedding cache keyed by chunk content hash). Writes
+    faiss.index + metadata.json atomically, the people graph and kb_manifest.json.
+
+    Returns {documents, chunks, embedded, cached, new_chunks, removed_chunks,
+    by_source, version}. ``embedded`` == chunks whose text/metadata is new or changed.
     """
     import faiss  # lazy: heavy
-    import numpy as np
     from src.chunker import chunk_documents
+    from src.people import build_people_graph, save_people_graph
     from src.utils import clean_chunk_metadata
+    from src.vector_store import write_index_files, reset
 
-    docs = load_jsonl(config.DOCUMENTS_FILE)
+    docs = load_all_documents()
     if not docs:
         raise ValueError(f"No documents found at {config.DOCUMENTS_FILE}. Crawl first.")
 
+    old_hashes = set()
+    if config.CHUNKS_FILE.exists():
+        old_hashes = {c.get("chunk_hash") for c in load_jsonl(config.CHUNKS_FILE)}
+
     if progress_cb:
         progress_cb(f"Chunking {len(docs)} documents…")
-    chunks = chunk_documents(docs, progress_cb=progress_cb)
-    chunks = [clean_chunk_metadata(ch) for ch in chunks]
-
-    # Persist chunks.jsonl too (keeps the classic pipeline artifacts in sync).
-    save_jsonl(config.CHUNKS_FILE, chunks)
-
+    chunks = [clean_chunk_metadata(ch) for ch in chunk_documents(docs, progress_cb=progress_cb)]
     if not chunks:
         raise ValueError("No chunks produced from the documents.")
+    save_jsonl(config.CHUNKS_FILE, chunks)
+    new_hashes = {c.get("chunk_hash") for c in chunks}
 
-    # ── Embed (cache-aware) ──────────────────────────────────────────────────────
     if use_cache:
         from src.embedding_cache import EmbeddingCache
         cache = EmbeddingCache()
-        embeddings, estats = cache.embed_chunks(chunks, show_progress=True)
-        live_hashes = {ch.get("chunk_hash") for ch in chunks}
-        cache.prune(live_hashes)
+        embeddings, estats = cache.embed_chunks(chunks, show_progress=False)
+        cache.prune(new_hashes)
         cache.save()
     else:
         from src.embeddings import embed_texts
         from src.utils import chunk_search_text
-        embeddings = embed_texts([chunk_search_text(ch) for ch in chunks], show_progress=True)
+        embeddings = embed_texts([chunk_search_text(ch) for ch in chunks])
         estats = {"embedded": len(chunks), "cached": 0}
 
-    dim = int(embeddings.shape[1])
-
-    # ── Build + persist the FAISS index (identical format to build_index) ────────
-    index = faiss.IndexFlatIP(dim)
+    index = faiss.IndexFlatIP(int(embeddings.shape[1]))
     index.add(embeddings.astype("float32"))
-    config.INDEX_DIR.mkdir(parents=True, exist_ok=True)
-    faiss.write_index(index, str(config.FAISS_INDEX))
+    write_index_files(index, [dict(ch) for ch in chunks])
+    reset()   # next query in THIS process reloads (servers swap via kb_sync instead)
 
-    metadata = [dict(ch) for ch in chunks]
-    with open(config.METADATA_FILE, "wb") as f:
-        pickle.dump(metadata, f)
-    with open(METADATA_JSON, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, ensure_ascii=False)
+    save_people_graph(build_people_graph(docs))
 
-    # Invalidate the in-process cache so the next search reloads fresh data.
-    try:
-        from src import vector_store
-        vector_store._INDEX, vector_store._METADATA = None, []
-    except Exception:
-        pass
-
-    n_docs = len({ch.get("document_id") for ch in chunks})
     by_source: Dict[str, int] = {}
     for ch in chunks:
-        s = ch.get("source", "unknown")
-        by_source[s] = by_source.get(s, 0) + 1
-    breakdown = ", ".join(f"{k}={v}" for k, v in sorted(by_source.items()))
-
+        by_source[ch.get("source", "unknown")] = by_source.get(ch.get("source", "unknown"), 0) + 1
     summary = {
-        "documents": n_docs, "chunks": len(chunks),
+        "documents": len({ch.get("document_id") for ch in chunks}),
+        "chunks": len(chunks),
         "embedded": estats["embedded"], "cached": estats["cached"],
+        "new_chunks": len(new_hashes - old_hashes) if old_hashes else len(new_hashes),
+        "removed_chunks": len(old_hashes - new_hashes) if old_hashes else 0,
+        "by_source": by_source,
+        "embedding_model": config.EMBEDDING_MODEL,
+        "pipeline_version": pipeline_version(),
     }
-    logger.info(f"Index rebuilt: {len(chunks)} vectors (dim={dim}) from {n_docs} docs "
-                f"[{breakdown}] — embedded {estats['embedded']}, reused {estats['cached']}.")
+    summary["version"] = write_kb_manifest(summary, version)["version"]
+    logger.info(f"Index rebuilt: {summary}")
     if progress_cb:
-        progress_cb(f"✓ Index rebuilt — {len(chunks)} chunks from {n_docs} docs "
-                    f"(embedded {estats['embedded']}, reused {estats['cached']}; {breakdown})")
+        progress_cb(f"✓ Index rebuilt — {len(chunks)} chunks from {summary['documents']} docs "
+                    f"(embedded {estats['embedded']}, reused {estats['cached']})")
     return summary

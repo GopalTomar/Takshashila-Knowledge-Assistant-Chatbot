@@ -47,6 +47,10 @@ def _resolve_users(usernames: Tuple[str, ...], bot_id: str
     missing: List[str] = []
     for name in usernames:
         user = mattermost_api.find_user_by_username(name)
+        from integrations import mattermost_bot as _bot
+        if user and user.get("id") and _bot.BLOCK_GUESTS and mattermost_api.recipient_is_guest(user):
+            missing.append(f"{name} (guest account)")
+            continue
         if user and user.get("id"):
             uid = user["id"]
             if uid == bot_id:
@@ -81,7 +85,7 @@ def send_to_group_dm(destination: Destination, payload: ResponsePayload,
         names = ", ".join(f'"{m}"' for m in missing)
         return DeliveryResult(
             False,
-            error=f"Unable to create the group message — these users were not found: {names}.",
+            error=f"Unable to create the group message — these users were not found or are guest accounts: {names}.",
         )
     if not recipient_ids:
         return DeliveryResult(

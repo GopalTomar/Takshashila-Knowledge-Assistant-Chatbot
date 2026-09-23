@@ -30,10 +30,10 @@ NO_EVIDENCE_SENTENCE = (
 _SYSTEM_BASE = """You are a precise research assistant for the Takshashila \
 Institution, an independent public-policy think-tank in India.
 
-Your ONLY source of knowledge is the context passages provided below. These \
-passages come from Takshashila's internal knowledge base. The Commit Knowledge \
-Base ("commit_kb") is the primary, most up-to-date source; the Staff Handbook \
-and other documents are supporting sources.
+Your ONLY source of knowledge is the numbered context passages provided below. \
+They come from Takshashila's knowledge base: the internal Commit Knowledge Base \
+("commit_kb", primary and most up to date for internal matters) and the public \
+Takshashila website (publications, blogs, op-eds, team profiles, programmes).
 
 STRICT RULES:
 1. Answer ONLY from the provided context. Use zero outside knowledge.
@@ -49,8 +49,14 @@ Treat the metadata line as trustworthy context, not as outside knowledge.
 EXACTLY this single line and nothing else:
    INSUFFICIENT_EVIDENCE
 6. Cite sources inline like [Source 1], [Source 2] right after each claim they \
-support. Do NOT write a separate "Sources" list at the end — the interface \
-shows the source list automatically, so a hand-written one would duplicate it."""
+support. Cite ONLY passage numbers that exist in the context, and only the \
+passage that actually states the claim. Do NOT write a separate "Sources" list \
+at the end — the interface shows the verified source list automatically.
+7. Describe each source only as what its metadata says it is: call something \
+internal (Commit KB, playbook, decision) only if its source line says Commit KB, \
+and never present a public website publication as an internal policy.
+8. If the question has several parts and the context supports only some of them, \
+answer those parts and state plainly which part the context does not cover."""
 
 # Per-length FORMAT guidance + a generation token budget. "normal" is the
 # balanced default; "short" is terse; "detailed" is comprehensive. All three keep
@@ -103,15 +109,13 @@ SYSTEM_PROMPT = _system_prompt("normal")
 
 NO_EVIDENCE_REPLY = (
     f"{NO_EVIDENCE_SENTENCE}\n\n"
-    "This topic may not be covered in the indexed Commit KB / Staff Handbook "
-    "content yet, or the question may be outside Takshashila's internal "
-    "knowledge base.\n\n"
+    "The indexed Takshashila sources do not "
+    "contain enough information to support an answer, so none is given rather "
+    "than risk an unsupported one.\n\n"
     "**You can try:**\n"
-    "- Rephrasing with Takshashila-specific terms (e.g. \"flag system\", "
-    "\"meeting rules\", \"core competencies\").\n"
-    "- Browsing the indexed pages in the **Browse Sources** tab.\n"
-    "- Re-running the Commit KB crawl and rebuilding the index if new pages "
-    "were added."
+    "- Rephrasing with more specific terms (a title, a person's name, a programme).\n"
+    "- Asking about a narrower aspect of the topic.\n"
+    "- Browsing the sources directly on takshashila.org.in."
 )
 
 
@@ -125,7 +129,7 @@ NO_EVIDENCE_REPLY = (
 # in depth before they can reach the model's context.
 
 # Minimum text a chunk must carry to count as evidence (nav pages are thin).
-_MIN_EVIDENCE_CHARS = 200
+_MIN_EVIDENCE_CHARS = 40   # thin pages are rejected at crawl time; this only drops fragments
 
 
 def _is_low_value_source(ch: Dict) -> bool:
@@ -235,6 +239,8 @@ def _build_context_block(chunks: List[Dict]) -> Tuple[str, List[Dict]]:
         section = str(ch.get("heading_path") or ch.get("section") or "").strip()
 
         meta_bits = [f"[Source {i+1}] {title}"]
+        if ch.get("content_type"):    meta_bits.append(f"type: {ch['content_type']}")
+        if ch.get("publisher"):       meta_bits.append(f"published in: {ch['publisher']}")
         if author:                    meta_bits.append(f"author: {author}")
         if ch.get("date"):            meta_bits.append(f"published: {ch['date']}")
         if ch.get("updated_date"):    meta_bits.append(f"updated: {ch['updated_date']}")
@@ -259,7 +265,13 @@ def _build_context_block(chunks: List[Dict]) -> Tuple[str, List[Dict]]:
     return "\n\n---\n\n".join(parts), sources
 
 
-def answer(
+def _grounding_summary(v: Dict) -> Dict:
+    return {k: v.get(k) for k in ("grounded", "grounding_score", "claims_total", "claims_supported",
+                                  "invalid_citations", "unsupported_citations", "attribution",
+                                  "overlap")}
+
+
+def _answer(
     query: str,
     top_k: int = config.TOP_K,
     model: Optional[str] = None,
@@ -274,6 +286,8 @@ def answer(
     mode: Optional[str] = None,
     # legacy alias
     source_type: Optional[str] = None,
+    allowed_sources: Optional[list] = None,
+    content_type: Optional[str] = None,
 ) -> Dict:
     """
     Full RAG pipeline. Returns:
@@ -300,7 +314,7 @@ def answer(
     chunks = retrieve(
         query=query, top_k=top_k,
         source=source, category=category, author=author, year=year,
-        use_hybrid=use_hybrid,
+        use_hybrid=use_hybrid, allowed_sources=allowed_sources, content_type=content_type,
     )
     retrieval_time = time.perf_counter() - _t_retr0
 
@@ -369,25 +383,32 @@ def answer(
                     "retrieval_time":  retrieval_time,
                     "generation_time": generation_time,
                     "citation_check":  v,
+                    "citations":       [],
+                    "grounding":       _grounding_summary(v),
                 }
             final_answer = v["answer"]
-            final_sources = v["sources"] or used_sources[:1]
-            # Confidence is capped by the best-cited source's cosine score, so a
+            final_sources = v["sources"]          # never a blind fallback attribution
+            # Confidence is capped by the cited sources' cosine scores, so a
             # weakly-supported citation can't masquerade as high confidence.
             if final_sources:
-                best_cited = max(
-                    (float(s.get("score", 0.0)) for s in final_sources), default=top
-                )
-                final_conf = confidence_level(final_sources) if best_cited else final_conf
+                final_conf = confidence_level(final_sources)
+            grounding = _grounding_summary(v)
+        else:
+            grounding = {"grounded": None, "attribution": "unverified"}
 
+        from src.citation_format import build_citations
+        clean_sources = [clean_chunk_metadata(s) for s in final_sources]
         return {
             "answer":          final_answer,
-            "sources":         [clean_chunk_metadata(s) for s in final_sources],
+            "sources":         clean_sources,
+            "citations":       build_citations(clean_sources, final_answer),
             "chunks":          chunks,
             "confidence":      final_conf,
             "top_score":       top,
             "retrieval_time":  retrieval_time,
             "generation_time": generation_time,
+            "grounding":       grounding,
+            "model":           model or config.GROQ_MODEL,
         }
 
     if stream_response:
@@ -415,3 +436,15 @@ def answer(
     )
     generation_time = time.perf_counter() - _t_gen0
     return _finish(text, generation_time)
+
+def answer(query: str, **kwargs) -> Dict:
+    """
+    Full RAG pipeline (see ``_answer``). Every result carries the same keys:
+    answer, sources, citations, chunks, confidence, top_score, retrieval_time,
+    generation_time, grounding, model.
+    """
+    result = _answer(query, **kwargs)
+    result.setdefault("citations", [])
+    result.setdefault("grounding", {"grounded": False, "attribution": "none"})
+    result.setdefault("model", kwargs.get("model") or config.GROQ_MODEL)
+    return result

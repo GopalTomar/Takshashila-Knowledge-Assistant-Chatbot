@@ -28,7 +28,10 @@ def _get_model():
         last_exc = None
         for attempt in range(1, 4):
             try:
-                _MODEL = SentenceTransformer(config.EMBEDDING_MODEL)
+                # After a failed online attempt, use the local cache only (a cached
+                # model must not become unusable because the Hub is unreachable).
+                _MODEL = SentenceTransformer(config.EMBEDDING_MODEL,
+                                             local_files_only=attempt > 1)
                 logger.info("Embedding model loaded successfully")
                 break
             except Exception as exc:

@@ -22,7 +22,9 @@ def _get_client():
                 "Add it to your .env file or Streamlit secrets."
             )
         from groq import Groq
-        _CLIENT = Groq(api_key=config.GROQ_API_KEY)
+        # Bounded latency: the SDK retries 429/5xx with backoff, then raises.
+        _CLIENT = Groq(api_key=config.GROQ_API_KEY, timeout=config.GROQ_TIMEOUT_SECONDS,
+                       max_retries=2)
     return _CLIENT
 
 

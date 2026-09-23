@@ -320,7 +320,17 @@ def format_sources(sources: List[Dict],
 
         card = [f"**{i}.** 📄 {title}"]
         meta_bits = []
-        if category:
+        ctype = _clean(src.get("content_type"))
+        if ctype:
+            from src.metadata import content_type_label
+            meta_bits.append(f"🗂️ {content_type_label(ctype)}")
+        authors = src.get("authors") or ([src["author"]] if src.get("author") else [])
+        if authors:
+            meta_bits.append("✍️ " + ", ".join(str(a) for a in authors[:3]))
+        date = _clean(src.get("publication_date") or src.get("date"))
+        if date:
+            meta_bits.append(f"📅 {date}")
+        if category and category.lower() != ctype.lower():
             meta_bits.append(f"🏷️ {category}")
         if url:
             meta_bits.append(f"[🔗 Open Document]({url})")

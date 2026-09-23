@@ -44,6 +44,16 @@ def send_to_channel(destination: Destination, payload: ResponsePayload,
     if allowed_channel_ids and channel_id not in allowed_channel_ids:
         return DeliveryResult(False, error=f'Posting to "{channel_name}" is not enabled for this bot.')
 
+    # Only members may push an answer into a channel, and internal answers never go
+    # into a channel that contains guest accounts.
+    if not mattermost_api.user_in_channel(channel_id, requester.user_id):
+        return DeliveryResult(False, error=f'You are not a member of "{channel_name}".')
+    from integrations import mattermost_bot as _bot
+    if _bot.BLOCK_GUESTS:
+        guests = mattermost_api.channel_guest_count(channel_id)
+        if guests is None or guests > 0:
+            return DeliveryResult(False, error=f'"{channel_name}" includes guest accounts (or could not be '
+                                               'checked), so internal answers cannot be posted there.')
     if not mattermost_api.bot_in_channel(channel_id):
         return DeliveryResult(
             False,
