@@ -183,3 +183,45 @@ Railway and GitHub Actions are unaffected (they use `/app/data` and the runner w
   local build, or delete the new assets; the API keeps serving whatever it last
   activated successfully.
 * Bad code: redeploy the previous commit in Railway (Deployments → Redeploy).
+
+## 9. Running the backend on another provider
+
+`railway.json` is optional — it only tells Railway to build the `Dockerfile` and
+health-check `/health`. Any container host (Render, Fly.io, Cloud Run, a VM with
+Docker) works the same way:
+
+* build the repository's `Dockerfile` (Linux image; no Windows/OneDrive dependency);
+* start command is the image default: `uvicorn api.main:app --host 0.0.0.0 --port $PORT`
+  (`PORT` defaults to `8000` when the host does not inject one);
+* health check: `GET /health` (liveness); readiness: `GET /ready` (200 once the KB
+  and model are loaded — allow up to ~3 minutes on first start);
+* set the same environment variables as in §3;
+* at least 2 GB RAM, one instance (the in-memory rate limiter and KB are per process).
+
+**Persistent data.** The only runtime data is the downloaded KB under `/app/data`.
+A persistent volume there is *optional*: without it the API re-downloads and
+verifies the latest encrypted bundle on every start (~130 MB). No other state is
+required — the embedding model is baked into the image.
+
+## 10. Production verification checklist
+
+```bash
+API=https://<service>.up.railway.app
+curl -fsS $API/health                        # {"status":"ok",...}
+curl -fsS $API/ready                         # 200 (503 while loading)
+curl -fsS $API/rag/status                    # kb.version, vectors, bundle_sync, refresh health
+curl -fsS -X POST $API/api/query -H 'Content-Type: application/json' \
+     -d '{"query":"What is Takshashila Institution?"}'          # public answer + website citations
+curl -s -o /dev/null -w '%{http_code}\n' -X POST $API/api/query \
+     -H 'Authorization: Bearer wrong' -H 'Content-Type: application/json' -d '{"query":"x"}'   # 401
+curl -s -o /dev/null -w '%{http_code}\n' -X POST $API/mattermost/ask -d 'token=wrong&text=hi'  # 403
+curl -s -D - -o /dev/null -X OPTIONS $API/api/query -H 'Origin: https://gopaltomar.github.io' \
+     -H 'Access-Control-Request-Method: POST' | grep -i access-control-allow-origin
+```
+
+Then open https://gopaltomar.github.io/Takshashila-Knowledge-Assistant-Chatbot/ —
+the header shows "Service online · KB <version>"; ask a question and open a citation.
+In Mattermost run `/askkb What is the red flag rule?` as a staff account (answer
+with Commit KB citations) and as a guest account (refused). After the next 06:00
+IST run: `gh run list --workflow kb-refresh.yml --limit 3` shows success and
+`/rag/status` reports the new `kb.version` within `KB_SYNC_INTERVAL_MINUTES`.

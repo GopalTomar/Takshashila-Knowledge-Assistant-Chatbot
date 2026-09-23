@@ -349,8 +349,17 @@ def api_person(name: str, scope=Depends(access_scope), _r=Depends(_require_ready
     p = find_person(name)
     if not p:
         raise HTTPException(status_code=404, detail="Person not found.")
-    return {k: p.get(k) for k in ("name", "slug", "profile_url", "role", "research_areas",
-                                   "work_count", "works")}
+    out = {k: p.get(k) for k in ("name", "slug", "profile_url", "role", "research_areas",
+                                  "work_count", "works")}
+    # The people graph is built from every source; only list works the caller may see
+    # (a byline on a Commit KB page must never reach an anonymous caller).
+    from src import vector_store
+    hidden = {m.get("document_id") for m in vector_store.get_state().metadata
+              if m.get("source") not in scope["sources"]}
+    works = [w for w in (out.get("works") or []) if w.get("document_id") not in hidden]
+    if len(works) != len(out.get("works") or []):
+        out["works"], out["work_count"] = works, len(works)
+    return out
 
 
 @app.get("/api/refresh-status")

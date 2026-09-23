@@ -153,6 +153,19 @@ def test_sources_and_people_endpoints_respect_scope(client):
     assert p["role"] == "Deputy Director" and p["work_count"] >= 2
 
 
+
+def test_people_endpoint_hides_internal_works_from_anonymous(client, monkeypatch):
+    import src.people as people
+    person = {"name": "Pranay Kotasthane", "works": [
+        {"title": "Public blog", "document_id": "website_blog1"},
+        {"title": "Sample Review Rule", "document_id": "commit_kb_sample"}], "work_count": 2}
+    monkeypatch.setattr(people, "find_person", lambda n: dict(person))
+    anon = client.get("/api/people/Pranay Kotasthane").json()
+    assert [w["title"] for w in anon["works"]] == ["Public blog"] and anon["work_count"] == 1
+    staff = client.get("/api/people/Pranay Kotasthane",
+                       headers={"Authorization": "Bearer staff-token-123"}).json()
+    assert staff["work_count"] == 2
+
 def test_stats_public_hides_internal_counts(client):
     s = client.get("/api/stats").json()
     assert s["scope"] == "public" and "by_source" not in s
