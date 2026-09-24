@@ -49,7 +49,7 @@ def bm25_tokenize(text: str) -> List[str]:
 class KBState:
     index: object                       # faiss.Index
     metadata: List[Dict]
-    bm25: object = None                 # rank_bm25.BM25Okapi or None
+    bm25: object = None                 # CompactBM25 (rank_bm25-identical scores) or None
     version: str = ""
     root: str = ""
     loaded_at: float = field(default_factory=time.time)
@@ -61,14 +61,78 @@ class KBState:
 
 _STATE: Optional[KBState] = None
 _LOAD_LOCK = threading.Lock()
+_SUSPENDED = False          # low-memory release swap in progress (see kb_sync)
+
+
+class KBReloading(RuntimeError):
+    """Raised while a low-memory release swap has no serving state (callers → 503)."""
 
 
 # ── Persistence helpers ─────────────────────────────────────────────────────────
+def _iter_json_array(path: Path, block: int = 1 << 20):
+    """
+    Yield the elements of a JSON array file one at a time. Equivalent to
+    ``json.load`` but without holding the whole file as one string, which keeps the
+    loading peak far below the file size (matters on 512 MB hosts).
+    """
+    dec = json.JSONDecoder()
+    buf, pos, started = "", 0, False
+    with open(path, "r", encoding="utf-8") as f:
+        while True:
+            # skip whitespace and separators
+            while True:
+                while pos < len(buf) and buf[pos] in " \t\r\n,":
+                    pos += 1
+                if pos < len(buf):
+                    break
+                more = f.read(block)
+                if not more:
+                    return
+                buf, pos = buf[pos:] + more, 0
+            if not started:
+                if buf[pos] != "[":
+                    raise ValueError(f"{path.name}: expected a JSON array")
+                started, pos = True, pos + 1
+                continue
+            if buf[pos] == "]":
+                return
+            while True:
+                try:
+                    obj, end = dec.raw_decode(buf, pos)
+                    break
+                except json.JSONDecodeError:
+                    more = f.read(block)
+                    if not more:
+                        raise
+                    buf, pos = buf[pos:] + more, 0
+            yield obj
+            pos = end
+            if pos > block:                       # drop consumed text
+                buf, pos = buf[pos:], 0
+
+
+def _share_values(items, keep_unique=("text", "meta_header")):
+    """
+    33k chunks come from ~2k documents, so most field values (url, title, authors,
+    categories…) repeat. Re-use one object per distinct value: ~half the memory,
+    identical content. Values are never mutated in place (results are copies).
+    """
+    pool: Dict = {}
+    for m in items:
+        for k, v in m.items():
+            if k in keep_unique:
+                continue
+            if isinstance(v, str):
+                m[k] = pool.setdefault(v, v)
+            elif isinstance(v, list) and v and all(isinstance(x, str) for x in v):
+                m[k] = pool.setdefault(("\0list",) + tuple(v), v)
+        yield m
+
+
 def _read_metadata(index_dir: Path) -> List[Dict]:
     meta_json, meta_pkl = index_dir / "metadata.json", index_dir / "metadata.pkl"
     if meta_json.exists():
-        with open(meta_json, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return list(_share_values(_iter_json_array(meta_json)))
     if config.ALLOW_PICKLE_METADATA and meta_pkl.exists():
         import pickle
         logger.warning("Loading legacy metadata.pkl (ALLOW_PICKLE_METADATA=true).")
@@ -92,15 +156,166 @@ def write_index_files(index, metadata: List[Dict], index_dir=None) -> None:
     stale_pkl = index_dir / "metadata.pkl"
     if stale_pkl.exists():            # never leave a pickle that disagrees with JSON
         stale_pkl.unlink()
+    try:                              # optional serving artifact; the API rebuilds without it
+        save_bm25_artifacts(index_dir, metadata)
+    except Exception as exc:
+        logger.warning(f"Could not precompute BM25 ({exc}); the API will build it at load.")
+        for f in ("bm25.json", "bm25.npz", "bm25_vocab.json"):
+            (index_dir / f).unlink(missing_ok=True)
 
 
-def _build_bm25(metadata: List[Dict]):
+class CompactBM25:
+    """
+    BM25 Okapi with the exact formulas, parameters and floating-point order of
+    ``rank_bm25.BM25Okapi`` (k1=1.5, b=0.75, epsilon=0.25; negative idf floored to
+    epsilon × average idf) — scores are identical — but stored as flat numpy postings
+    (term → docs, tf) instead of one Python dict per chunk: ~10× less memory.
+    """
+
+    def __init__(self, corpus, k1: float = 1.5, b: float = 0.75, epsilon: float = 0.25):
+        import math
+        from array import array
+        self.k1, self.b, self.epsilon = k1, b, epsilon
+        vocab: Dict[str, int] = {}
+        terms, docs, tfs, doc_len = array("i"), array("i"), array("i"), array("i")
+        total = 0
+        for d, tokens in enumerate(corpus):
+            doc_len.append(len(tokens))
+            total += len(tokens)
+            freqs: Dict[str, int] = {}
+            for w in tokens:
+                freqs[w] = freqs.get(w, 0) + 1
+            for w, c in freqs.items():
+                tid = vocab.get(w)
+                if tid is None:
+                    tid = vocab[w] = len(vocab)
+                terms.append(tid)
+                docs.append(d)
+                tfs.append(c)
+        self.corpus_size = len(doc_len)
+        self.avgdl = total / self.corpus_size
+        self.vocab = vocab
+        t = np.frombuffer(terms, dtype=np.int32)
+        order = np.argsort(t, kind="stable")                  # docs stay ascending per term
+        self.post_docs = np.frombuffer(docs, dtype=np.int32)[order].copy()
+        self.post_tf = np.frombuffer(tfs, dtype=np.int32)[order].astype(np.int64)
+        df = np.bincount(t, minlength=len(vocab))
+        self.ptr = np.concatenate(([0], np.cumsum(df))).astype(np.int64)
+        self.doc_len = np.frombuffer(doc_len, dtype=np.int32).astype(np.int64)
+        # idf in vocabulary (first-seen) order — the same summation order as rank_bm25.
+        idf = np.empty(len(vocab), dtype=np.float64)
+        idf_sum, negative = 0.0, []
+        for tid in range(len(vocab)):
+            freq = int(df[tid])
+            v = math.log(self.corpus_size - freq + 0.5) - math.log(freq + 0.5)
+            idf[tid] = v
+            idf_sum += v
+            if v < 0:
+                negative.append(tid)
+        self.average_idf = idf_sum / len(vocab)
+        eps = self.epsilon * self.average_idf
+        for tid in negative:
+            idf[tid] = eps
+        self.idf = idf
+        # rank_bm25 evaluates  q_freq + k1 * (1 - b + b * doc_len / avgdl)
+        self._norm = self.k1 * (1 - self.b + self.b * self.doc_len / self.avgdl)
+
+    # ── persistence (precomputed at index-build time; saves minutes on a 0.1-CPU start)
+    _SCALARS = ("corpus_size", "avgdl", "average_idf", "k1", "b", "epsilon")
+
+    def save(self, index_dir: Path, fingerprint: str) -> None:
+        index_dir = Path(index_dir)
+        tmp_npz, tmp_voc, tmp_man = (index_dir / "bm25.npz.tmp", index_dir / "bm25_vocab.json.tmp",
+                                     index_dir / "bm25.json.tmp")
+        with open(tmp_npz, "wb") as f:
+            np.savez(f, post_docs=self.post_docs, post_tf=self.post_tf.astype(np.int32), ptr=self.ptr,
+                     doc_len=self.doc_len.astype(np.int32), idf=self.idf,
+                     scalars=np.array([float(getattr(self, k)) for k in self._SCALARS], dtype=np.float64))
+        vocab = [None] * len(self.vocab)
+        for w, i in self.vocab.items():
+            vocab[i] = w
+        tmp_voc.write_text(json.dumps(vocab, ensure_ascii=False), encoding="utf-8")
+        tmp_man.write_text(json.dumps({"format": BM25_FORMAT, "fingerprint": fingerprint,
+                                       "documents": self.corpus_size}), encoding="utf-8")
+        tmp_npz.replace(index_dir / "bm25.npz")
+        tmp_voc.replace(index_dir / "bm25_vocab.json")
+        tmp_man.replace(index_dir / "bm25.json")          # manifest last
+
+    @classmethod
+    def load(cls, index_dir: Path) -> "CompactBM25":
+        index_dir = Path(index_dir)
+        self = cls.__new__(cls)
+        with np.load(index_dir / "bm25.npz", allow_pickle=False) as z:
+            self.post_docs = z["post_docs"]
+            self.post_tf = z["post_tf"].astype(np.int64)
+            self.ptr = z["ptr"]
+            self.doc_len = z["doc_len"].astype(np.int64)
+            self.idf = z["idf"]
+            sc = z["scalars"]
+        (corpus_size, self.avgdl, self.average_idf, self.k1, self.b, self.epsilon) = [float(x) for x in sc]
+        self.corpus_size = int(corpus_size)
+        words = json.loads((index_dir / "bm25_vocab.json").read_text(encoding="utf-8"))
+        self.vocab = {w: i for i, w in enumerate(words)}
+        self._norm = self.k1 * (1 - self.b + self.b * self.doc_len / self.avgdl)
+        return self
+
+    def get_scores(self, query: List[str]) -> np.ndarray:
+        score = np.zeros(self.corpus_size)
+        for q in query:
+            tid = self.vocab.get(q)
+            if tid is None:
+                continue                                        # rank_bm25 adds 0 here
+            lo, hi = self.ptr[tid], self.ptr[tid + 1]
+            d = self.post_docs[lo:hi]
+            f = self.post_tf[lo:hi]
+            w = self.idf[tid] or 0
+            score[d] += w * (f * (self.k1 + 1) / (f + self._norm[d]))
+        return score
+
+
+BM25_FORMAT = 2
+
+
+def bm25_fingerprint(index_dir: Path) -> str:
+    """
+    Identity of what BM25 indexes: the exact bytes of ``metadata.json`` (every chunk's
+    text and header) plus the tokenizer rules. A precomputed BM25 is used only if this
+    matches, so it can never serve a different metadata file. Streamed: cheap and
+    constant-memory even on a 0.1-CPU start.
+    """
+    import hashlib
+    h = hashlib.sha256(f"v{BM25_FORMAT}|{_TOKEN_RE.pattern}|{' '.join(sorted(_BM25_STOP))}|".encode())
+    with open(Path(index_dir) / "metadata.json", "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _compute_bm25(metadata: List[Dict]) -> "CompactBM25":
+    from src.utils import chunk_search_text
+    return CompactBM25(bm25_tokenize(chunk_search_text(ch)) or ["_"] for ch in metadata)
+
+
+def save_bm25_artifacts(index_dir: Path, metadata: List[Dict]) -> None:
+    """Precompute BM25 for a release (after metadata.json is written, or when packed)."""
+    if metadata:
+        _compute_bm25(metadata).save(Path(index_dir), bm25_fingerprint(index_dir))
+
+
+def _build_bm25(metadata: List[Dict], index_dir: Optional[Path] = None):
     if not metadata:
         return None
     try:
-        from rank_bm25 import BM25Okapi
-        from src.utils import chunk_search_text
-        return BM25Okapi([bm25_tokenize(chunk_search_text(ch)) or ["_"] for ch in metadata])
+        if index_dir is not None and (Path(index_dir) / "bm25.json").exists():
+            try:
+                man = json.loads((Path(index_dir) / "bm25.json").read_text(encoding="utf-8"))
+                if (man.get("format") == BM25_FORMAT and man.get("documents") == len(metadata)
+                        and man.get("fingerprint") == bm25_fingerprint(index_dir)):
+                    return CompactBM25.load(index_dir)
+                logger.warning("Precomputed BM25 does not match this release — rebuilding.")
+            except Exception as exc:
+                logger.warning(f"Precomputed BM25 unreadable ({exc}) — rebuilding.")
+        return _compute_bm25(metadata)
     except Exception as exc:
         logger.warning(f"BM25 build failed (FAISS-only retrieval): {exc}")
         return None
@@ -114,12 +329,16 @@ def build_state(version: str = "", root: Optional[Path] = None) -> KBState:
     if not index_path.exists():
         raise FileNotFoundError(f"FAISS index not found at {index_path}. Run a build first.")
     t0 = time.perf_counter()
-    index = faiss.read_index(str(index_path))
+    if config.KB_LOW_MEMORY and hasattr(faiss, "IO_FLAG_MMAP_IFC"):
+        # Memory-map the vectors (file-backed, reclaimable pages; identical results).
+        index = faiss.read_index(str(index_path), faiss.IO_FLAG_MMAP_IFC)
+    else:
+        index = faiss.read_index(str(index_path))
     metadata = _read_metadata(root / "index")
     if index.ntotal != len(metadata):
         raise ValueError(f"Index/metadata mismatch: {index.ntotal} vectors vs {len(metadata)} records")
     t1 = time.perf_counter()
-    bm25 = _build_bm25(metadata)
+    bm25 = _build_bm25(metadata, root / "index")
     t2 = time.perf_counter()
     manifest = root / "kb_manifest.json"
     if not version and manifest.exists():
@@ -129,13 +348,40 @@ def build_state(version: str = "", root: Optional[Path] = None) -> KBState:
             version = ""
     logger.info(f"KB state built: {index.ntotal} vectors (index+metadata {t1-t0:.1f}s, "
                 f"BM25 {t2-t1:.1f}s) version={version or 'unversioned'}")
+    release_free_memory()
     return KBState(index=index, metadata=metadata, bm25=bm25, version=version, root=str(root))
+
+
+def release_free_memory() -> None:
+    """Return freed heap to the OS after large loads (glibc only; no-op elsewhere)."""
+    import gc
+    gc.collect()
+    try:
+        import ctypes
+        import sys
+        if sys.platform.startswith("linux"):
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 
 def set_state(state: KBState) -> None:
     """Atomically make ``state`` the serving state."""
-    global _STATE
+    global _STATE, _SUSPENDED
     _STATE = state
+    _SUSPENDED = False
+
+
+def suspend() -> None:
+    """Release the serving state for a low-memory swap; loads are refused until set_state."""
+    global _STATE, _SUSPENDED
+    _SUSPENDED = True
+    _STATE = None
+
+
+def resume() -> None:
+    global _SUSPENDED
+    _SUSPENDED = False
 
 
 def load_index(force: bool = False) -> KBState:
@@ -143,6 +389,8 @@ def load_index(force: bool = False) -> KBState:
     global _STATE
     if _STATE is not None and not force:
         return _STATE
+    if _SUSPENDED and not force:
+        raise KBReloading("The knowledge base is being updated. Try again in a minute.")
     with _LOAD_LOCK:
         if _STATE is not None and not force:
             return _STATE

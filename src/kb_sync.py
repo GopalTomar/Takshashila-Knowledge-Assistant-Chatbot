@@ -1,7 +1,7 @@
 """
 kb_sync.py — Keep a running API on the latest published KB release.
 
-The API (Railway) never crawls. It polls the public release manifest written by
+The API (Render) never crawls. It polls the public release manifest written by
 the scheduled refresh job; when a new version appears it:
 
   1. downloads the encrypted bundle to data/releases/<version>.download,
@@ -80,8 +80,7 @@ def current_version() -> str:
         return ""
 
 
-def activate_release(release_dir: Path) -> None:
-    """Build a serving state from ``release_dir`` and swap it in (validated first)."""
+def _checked_state(release_dir: Path):
     from src import vector_store
     from src.retriever import retrieve
     state = vector_store.build_state(root=release_dir)
@@ -89,6 +88,50 @@ def activate_release(release_dir: Path) -> None:
         raise ValueError("release has an empty index")
     if not retrieve("Takshashila Institution", top_k=2, state=state):
         raise ValueError("release smoke query returned no results")
+    return state
+
+
+def _precheck_on_disk(release_dir: Path) -> None:
+    """Cheap structural checks before any in-memory state is released."""
+    for rel in ("index/faiss.index", "index/metadata.json", "kb_manifest.json"):
+        f = release_dir / rel
+        if not f.exists() or f.stat().st_size == 0:
+            raise ValueError(f"release is missing {rel}")
+    json.loads((release_dir / "kb_manifest.json").read_text(encoding="utf-8"))
+
+
+def _build_low_memory(release_dir: Path):
+    """
+    KB_LOW_MEMORY: never hold two KB states at once. The new release is already
+    downloaded, verified and unpacked on disk; release the old state, load the new
+    one, and if that fails load the previous release back from disk.
+    """
+    import gc
+    from src import vector_store
+    _precheck_on_disk(release_dir)
+    previous = Path(config.KB_ROOT) if vector_store.is_loaded() else None
+    vector_store.suspend()
+    gc.collect()
+    vector_store.release_free_memory()
+    try:
+        return _checked_state(release_dir)
+    except Exception:
+        if previous is not None and (previous / "index" / "faiss.index").exists():
+            logger.error(f"New release {release_dir.name} failed to load — restoring {previous.name}.")
+            try:
+                vector_store.set_state(vector_store.build_state(root=previous))
+            except Exception as exc:                       # pragma: no cover — disk damaged
+                logger.error(f"Could not restore previous release: {exc}")
+                vector_store.resume()
+        else:
+            vector_store.resume()
+        raise
+
+
+def activate_release(release_dir: Path) -> None:
+    """Build a serving state from ``release_dir`` and swap it in (validated first)."""
+    from src import vector_store
+    state = _build_low_memory(release_dir) if config.KB_LOW_MEMORY else _checked_state(release_dir)
     config.RELEASES_DIR.mkdir(parents=True, exist_ok=True)
     tmp = config.CURRENT_POINTER.with_suffix(".tmp")
     tmp.write_text(release_dir.name + "\n", encoding="utf-8")

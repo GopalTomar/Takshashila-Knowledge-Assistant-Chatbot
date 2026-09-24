@@ -14,9 +14,14 @@ the passage it cites, and insufficient evidence yields an explicit refusal.
 | Interface | Where | Scope |
 |---|---|---|
 | Web UI | GitHub Pages (`frontend/`) | public website content; staff token unlocks internal |
-| REST API | Railway (`api/main.py`) | same |
-| Mattermost `/askkb` | same Railway service (`/mattermost/*`) | internal (Commit KB + website) |
+| REST API | Render Free (`api/main.py`, Docker) | same |
+| Mattermost `/askkb` | same Render service (`/mattermost/*`) | internal (Commit KB + website) |
 | Streamlit dashboard | local / internal (`app.py`) | all; admin tabs password-gated |
+
+**Production (no laptop involved):**
+**GitHub Pages** = frontend · **Render Free** = FastAPI backend (`https://<service>.onrender.com`) ·
+**GitHub Actions** = CI, Pages deployment, daily KB refresh + encrypted bundle ·
+**Mattermost** `/askkb` → Render `/mattermost/ask`. Setup: [DEPLOYMENT](DEPLOYMENT.md).
 
 The knowledge base refreshes itself **every day at 06:00 Asia/Kolkata** on GitHub
 Actions — incrementally, validated, and promoted atomically — with no laptop involved.
@@ -78,7 +83,7 @@ scripts/           crawl engine, refresh CLI + gate, validation, audit, release 
 frontend/          GitHub Pages site (HTML/CSS/JS; build.py injects the API URL)
 tests/             hermetic pytest suite (fake embeddings; no network, no LLM)
 .github/workflows/ ci.yml, deploy-pages.yml, kb-refresh.yml
-Dockerfile, railway.json
+Dockerfile, render.yaml  Render Free deployment (see DEPLOYMENT.md)
 app.py             Streamlit dashboard
 ```
 
@@ -86,7 +91,7 @@ app.py             Streamlit dashboard
 
 All configuration is environment-driven; see `env.example` for every variable.
 Secrets (Groq key, Commit KB credentials, Mattermost tokens, bundle key, staff tokens)
-live only in `.env` locally, Railway variables and GitHub secrets — never in the repo
+live only in `.env` locally, Render environment variables and GitHub secrets — never in the repo
 or the frontend.
 
 ## Tests

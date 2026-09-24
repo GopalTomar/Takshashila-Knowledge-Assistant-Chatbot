@@ -227,6 +227,10 @@ ALLOWED_TEAM_IDS = _csv_set(os.getenv("MATTERMOST_ALLOWED_TEAM_IDS", ""))
 # answer may be posted into a channel that contains guests. Requires the bot token
 # (roles are looked up via the Mattermost API).
 BLOCK_GUESTS = os.getenv("MATTERMOST_BLOCK_GUESTS", "true").lower() in ("1", "true", "yes", "on")
+
+# Set by the hosting API (api.main) to report whether the KB is loaded; None when the
+# bot runs standalone (it then loads the KB itself on first use).
+READINESS_PROBE = None
 ALLOWED_CHANNEL_IDS = _csv_set(os.getenv("MATTERMOST_ALLOWED_CHANNEL_IDS", ""))
 
 # ── Enterprise routing (--user / --channel / --group destinations) ───────────────
@@ -262,12 +266,20 @@ DIALOG_URL = f"{PUBLIC_BASE_URL}/mattermost/dialog" if PUBLIC_BASE_URL else ""
 # ⬇️ Download PDF renders the already-generated answer to a PDF (via pymupdf,
 # already a project dependency) and uploads it — no second RAG run. Requires the
 # bot token (to upload the file) and pymupdf to be importable.
-try:
-    import pymupdf as _fitz  # PyMuPDF
-    _HAVE_PYMUPDF = True
-except Exception:  # pragma: no cover - pymupdf is a listed dependency
-    _fitz = None
-    _HAVE_PYMUPDF = False
+# Imported lazily on first export: the native library is large and most processes
+# (especially a 512 MB host) never render a PDF. Only availability is checked here.
+import importlib.util as _ilu  # noqa: E402
+
+_fitz = None
+_HAVE_PYMUPDF = _ilu.find_spec("pymupdf") is not None
+
+
+def _load_fitz():
+    global _fitz
+    if _fitz is None and _HAVE_PYMUPDF:
+        import pymupdf
+        _fitz = pymupdf
+    return _fitz
 
 ENABLE_PDF_EXPORT = (
     _HAVE_PYMUPDF
@@ -1144,7 +1156,7 @@ def _markdown_to_pdf_bytes(markdown_text: str) -> Optional[bytes]:
     text reads well; this is a portable export, not a full markdown renderer.
     Returns the PDF bytes, or ``None`` if pymupdf is unavailable.
     """
-    if not (_HAVE_PYMUPDF and _fitz):
+    if not (_HAVE_PYMUPDF and _load_fitz()):
         return None
 
     # Light markdown → plain text (headings, bullets, bold/italics, links).
@@ -1540,6 +1552,12 @@ async def mattermost_ask(
     # No question after the modifiers → show the friendly landing, not an error.
     if not question:
         return _ephemeral(help_text.format_landing())
+
+    # The hosting API sets a readiness probe. On a free instance that was asleep the
+    # knowledge base is still downloading for ~1–3 minutes after the wake-up request.
+    if READINESS_PROBE is not None and not READINESS_PROBE():
+        return _ephemeral("⏳ The Knowledge Assistant is starting up (it sleeps when idle). "
+                          "Please ask again in about two minutes.")
 
     # ── External destination (--user / --channel / --group) ─────────────────────
     # Retrieval is scheduled exactly as normal; only the delivery target differs.

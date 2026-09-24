@@ -2,7 +2,7 @@
 kb_bundle.py — Pack / encrypt / verify / unpack a KB release for distribution.
 
 The refresh job (GitHub Actions) builds a release and publishes it as a GitHub
-Release asset; the API (Railway) downloads and activates it. Because the GitHub
+Release asset; the API (Render) downloads and activates it. Because the GitHub
 repository is PUBLIC and the KB contains internal Commit KB content, the bundle
 is always encrypted:
 
@@ -99,11 +99,18 @@ def sha256_file(path: Path) -> str:
 
 
 def pack(root: Path, out_file: Path, key_b64: str, members: Iterable[str] = BUNDLE_MEMBERS) -> Dict:
-    """Tar+gzip the KB members of ``root`` and encrypt to ``out_file``. Returns a manifest."""
+    """
+    Tar the KB members of ``root`` and encrypt to ``out_file``. Returns a manifest.
+
+    The tar is NOT gzip-compressed: most of the bundle (FAISS vectors, embedding
+    cache) barely compresses, and on a 0.1-CPU API host (Render Free) gunzip took
+    ~4 of the ~6 minutes of a cold start, while downloading the extra ~230 MB takes
+    seconds. ``unpack`` reads both compressed (older) and uncompressed bundles.
+    """
     root = Path(root)
     out_file.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryFile() as tmp:
-        with tarfile.open(fileobj=tmp, mode="w:gz") as tar:
+        with tarfile.open(fileobj=tmp, mode="w") as tar:
             for m in members:
                 p = root / m
                 if p.exists():
@@ -148,7 +155,7 @@ def unpack(bundle_file: Path, dest: Path, key_b64: str, expected_sha256: str = "
         with open(bundle_file, "rb") as f:
             decrypt_stream(f, tmp, key_b64)
         tmp.seek(0)
-        with tarfile.open(fileobj=tmp, mode="r:gz") as tar:
+        with tarfile.open(fileobj=tmp, mode="r:*") as tar:        # plain or gzip (older bundles)
             members = list(_safe_members(tar))
             tar.extractall(str(dest), members=members)
     return dest

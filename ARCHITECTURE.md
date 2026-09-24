@@ -15,12 +15,13 @@ This describes the system **as implemented** on the `production-hardening` branc
                       └───────────────┬───────────────────────────────────────────────▲──────────────┘
                                       │ HTTPS  POST /api/query (CORS allow-list)       │ poll manifest,
                                       ▼                                                │ download bundle
-                      ┌──────────────────────────── Railway (Docker) ──────────────────┴─────────────┐
+                      ┌────────────────────── Render Free (Docker, 512 MB) ────────────┴─────────────┐
  Mattermost ────────► │ api.main:app (uvicorn, 1 worker, $PORT)                                       │
  /askkb slash cmd     │   /health, /api/health, /api/query, /api/stats, /api/sources/{id},            │
  + button callbacks   │   /api/people/{name}, /api/refresh-status, /mattermost/*                      │
                       │   src.kb_sync: verify sha256 → decrypt → extract → build state → smoke →      │
-                      │                atomic in-memory swap (no downtime; failure keeps old KB)      │
+                      │                swap (KB_LOW_MEMORY: verify on disk → release → load; failure │
+                      │                reloads the previous release; otherwise zero-downtime swap)   │
                       │   ONE engine: src.rag_pipeline → src.retriever → src.vector_store (FAISS+BM25) │
                       │               → Groq LLM → src.citations (claim-level verification)           │
                       └───────────────────────────────────────────────────────────────────────────────┘
@@ -135,7 +136,7 @@ The legacy flat layout (`data/processed`, `data/index`) is still readable when n
 ## 6. Security model
 
 * Commit KB content never enters git or the public site. It travels only inside
-  AES-256-GCM encrypted bundles (key in GitHub secrets + Railway).
+  AES-256-GCM encrypted bundles (key in GitHub secrets + Render).
 * Public API callers get website-only answers; staff tokens unlock internal sources.
 * Mattermost: slash token (constant-time), HMAC-signed button contexts and
   dialog state (bound to the channel), post/channel check before deletions.

@@ -88,6 +88,8 @@ async def lifespan(_app: FastAPI):
     from src import kb_sync
     from integrations import mattermost_bot
     mattermost_bot.mattermost_startup(warm=False)   # config checks; warm-up happens below
+    from src import vector_store
+    mattermost_bot.READINESS_PROBE = lambda: bool(_ready["ok"] and vector_store.is_loaded())
     threading.Thread(target=_warm, name="warm", daemon=True).start()
     kb_sync.start_background_sync()
     yield
@@ -185,7 +187,7 @@ def rate_limit(request: Request) -> None:
 # ── Health ────────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    """Liveness: the process is up (used by Railway / Docker health checks)."""
+    """Liveness: the process is up (used by Render / Docker health checks)."""
     return {"status": "ok", "service": "takshashila-knowledge-assistant", "version": VERSION}
 
 
@@ -216,9 +218,11 @@ def api_health():
 def ready():
     """Readiness: 200 only when the KB and embedding model are loaded (else 503)."""
     from src import vector_store
-    body = {"ready": _ready["ok"], "error": _ready["error"],
+    ok = _ready["ok"] and vector_store.is_loaded()     # False during a low-memory KB swap
+    body = {"ready": ok, "error": _ready["error"],
             "kb_version": vector_store.get_state().version if vector_store.is_loaded() else None}
-    return JSONResponse(status_code=200 if _ready["ok"] else 503, content=body)
+    return JSONResponse(status_code=200 if ok else 503, content=body,
+                        headers=None if ok else {"Retry-After": "30"})
 
 
 @app.get("/rag/status")
@@ -228,8 +232,10 @@ def rag_status():
 
 
 def _require_ready(request: Request) -> None:
-    if not _ready["ok"]:
-        raise HTTPException(status_code=503, detail="The knowledge base is still loading. Try again shortly.")
+    from src import vector_store
+    if not _ready["ok"] or not vector_store.is_loaded():
+        raise HTTPException(status_code=503, detail="The knowledge base is still loading. Try again shortly.",
+                            headers={"Retry-After": "30"})
 
 
 # ── Query ─────────────────────────────────────────────────────────────────────────
@@ -294,6 +300,9 @@ async def api_query(req: QueryRequest, request: Request, scope=Depends(access_sc
         raise
     except Exception as exc:
         jlog("query_error", request_id=rid, error=type(exc).__name__)
+        if type(exc).__name__ == "KBReloading":           # low-memory release swap in progress
+            raise HTTPException(status_code=503, headers={"Retry-After": "30"},
+                                detail="The knowledge base is being updated. Please try again in a minute.")
         if type(exc).__name__ == "RateLimitError":        # LLM provider quota (Groq 429)
             raise HTTPException(status_code=503, headers={"Retry-After": "60"},
                                 detail="The AI service is busy right now. Please try again in a minute.")

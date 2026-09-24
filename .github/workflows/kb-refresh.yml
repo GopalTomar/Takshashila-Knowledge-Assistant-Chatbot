@@ -7,7 +7,7 @@
 #
 # Flow: restore last published KB → incremental crawl (website + Commit KB) →
 # re-embed changed chunks → FAISS/BM25 → validate + smoke test → publish an
-# ENCRYPTED bundle to the "kb-latest" release → the Railway API picks it up.
+# ENCRYPTED bundle to the "kb-latest" release → the Render API picks it up.
 # A failed run publishes nothing but status; the API keeps the previous KB.
 #
 # Required repository secrets: KB_BUNDLE_KEY, COMMIT_KB_USERNAME, COMMIT_KB_PASSWORD
@@ -124,7 +124,12 @@ jobs:
       - name: Restore last published KB
         run: |
           mkdir -p prev
-          gh release download "$RELEASE_TAG" -p "kb-*" -D prev || true
+          gh release download "$RELEASE_TAG" -p kb-manifest.json -p kb-status.json -D prev || true
+          if [ -f prev/kb-manifest.json ]; then
+            # only the bundle the manifest points to (the release keeps two)
+            asset=$(python -c "import json; print(json.load(open('prev/kb-manifest.json'))['asset'])")
+            gh release download "$RELEASE_TAG" -p "$asset" -D prev
+          fi
           python scripts/kb_release.py restore --from-dir prev
 
       - name: Refresh knowledge base

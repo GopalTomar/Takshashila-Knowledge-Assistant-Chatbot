@@ -2,7 +2,7 @@
 """
 Build the static GitHub Pages site into frontend/dist/.
 
-    API_BASE_URL=https://<your-api>.up.railway.app python frontend/build.py
+    API_BASE_URL=https://<your-service>.onrender.com python frontend/build.py
 
 Only the PUBLIC API base URL is injected (into config.js). Nothing secret is ever
 written to the site. The build fails if the URL is missing (unless
@@ -32,7 +32,7 @@ def main(argv=None) -> int:
 
     api = os.getenv("API_BASE_URL", "").strip().rstrip("/")
     if not api and not args.allow_empty_api:
-        print("ERROR: API_BASE_URL is not set (e.g. https://takshashila-rag.up.railway.app)", file=sys.stderr)
+        print("ERROR: API_BASE_URL is not set (e.g. https://<your-service>.onrender.com)", file=sys.stderr)
         return 2
     if api and not (api.startswith("https://") or re.match(r"^http://(localhost|127\.0\.0\.1)(:\d+)?$", api)):
         print(f"ERROR: API_BASE_URL must be https:// (got {api!r})", file=sys.stderr)

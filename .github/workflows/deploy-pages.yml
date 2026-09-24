@@ -2,6 +2,10 @@
 # The backend URL comes from the repository VARIABLE API_BASE_URL
 # (Settings → Secrets and variables → Actions → Variables). It is a public URL,
 # not a secret; no secrets are ever written into the site.
+# Only frontend/dist (HTML/CSS/JS/assets + config.js with the API URL) is published —
+# never data/, backend code or credentials. The build uses the standard library only.
+# Until API_BASE_URL is set (i.e. before the Render service exists) the deployment is
+# skipped with a warning instead of failing.
 name: Deploy frontend to GitHub Pages
 
 on:
@@ -20,10 +24,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  api-url-missing:
+    if: vars.API_BASE_URL == ''
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "::warning::Repository variable API_BASE_URL is not set (https://<render-service>.onrender.com) — Pages deployment skipped."
+
   build:
+    if: vars.API_BASE_URL != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

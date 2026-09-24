@@ -2,6 +2,7 @@
 .env
 .env.*
 !env.example
+!.env.example
 .streamlit/secrets.toml
 *.pem
 *.key
@@ -70,6 +71,15 @@ models/
 *.bak
 *.bak_*
 *.backup
+
+# ── Local deployment / scratch artifacts ─────────────────────────────────────────
+scratchpad/
+*.bundle
+*.tar
+*.tar.gz
+*.tgz
+.render/
+data/cache/
 
 # ── Temporary / partial files ───────────────────────────────────────────────────
 *.tmp

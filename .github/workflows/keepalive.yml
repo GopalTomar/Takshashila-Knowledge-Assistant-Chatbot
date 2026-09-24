@@ -1,0 +1,40 @@
+# Optional: keep the Render Free API awake.
+#
+# Render Free web services sleep after ~15 minutes without traffic; waking up and
+# re-loading the KB takes a few minutes (Mattermost /askkb users then see a
+# "starting up" message). Pinging /health every 10 minutes keeps one service up
+# 24/7, which fits Render's 750 free instance-hours per month (max 744 h/month).
+#
+# Disabled unless the repository VARIABLE RENDER_KEEPALIVE_URL is set to the
+# service's base URL (https://<service>.onrender.com). Delete the variable to stop.
+name: Keep API awake (optional)
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write            # re-enable this schedule (GitHub disables idle schedules after 60 days)
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: true
+
+jobs:
+  ping:
+    if: vars.RENDER_KEEPALIVE_URL != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Ping /health
+        env:
+          URL: ${{ vars.RENDER_KEEPALIVE_URL }}
+        run: |
+          curl -fsS --max-time 180 "${URL%/}/health" >/dev/null && echo "API awake" \
+            || echo "::warning::API did not answer /health"
+      - name: Keep this schedule enabled
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/keepalive.yml/enable" || true

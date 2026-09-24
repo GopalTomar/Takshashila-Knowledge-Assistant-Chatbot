@@ -1,5 +1,8 @@
 # Audit report — Takshashila Knowledge Assistant
 
+> **Deployment update (2026-09-24):** the backend now runs on **Render Free** instead of Railway — see `DEPLOYMENT.md`. Railway references below are historical.
+
+
 Audit of the repository at baseline tag `baseline-pre-audit` (commit `2675516`,
 2026-09-23), before the `production-hardening` branch. Every finding below was
 verified against the code or data; the **Resolution** column says what was done

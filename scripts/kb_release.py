@@ -66,6 +66,16 @@ def pack(out_dir: Path) -> int:
     for f in config.REPORTS_DIR.glob("*.json"):
         rep.mkdir(parents=True, exist_ok=True)
         shutil.copy2(f, rep / f.name)
+    # Serving artifact for fast, low-CPU API starts (older releases lack it).
+    from src import vector_store
+    try:
+        man = json.loads((root / "index" / "bm25.json").read_text(encoding="utf-8"))
+        fresh = (man.get("format") == vector_store.BM25_FORMAT
+                 and man.get("fingerprint") == vector_store.bm25_fingerprint(root / "index"))
+    except Exception:
+        fresh = False
+    if not fresh:
+        vector_store.save_bm25_artifacts(root / "index", vector_store._read_metadata(root / "index"))
     out_dir.mkdir(parents=True, exist_ok=True)
     version = json.loads((root / "kb_manifest.json").read_text(encoding="utf-8"))["version"]
     man = kb_bundle.pack(root, out_dir / f"kb-{version}.tkkb", config.KB_BUNDLE_KEY)

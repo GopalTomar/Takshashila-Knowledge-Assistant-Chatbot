@@ -5,7 +5,7 @@
 
 The knowledge base now refreshes **daily at 06:00 Asia/Kolkata on GitHub Actions**
 (`.github/workflows/kb-refresh.yml`) — incrementally, validated, and promoted
-atomically — and the Railway API picks up each new release automatically. No local
+atomically — and the Render API picks up each new release automatically. No local
 machine needs to be on.
 
 * How it works: [ARCHITECTURE.md](ARCHITECTURE.md) §3

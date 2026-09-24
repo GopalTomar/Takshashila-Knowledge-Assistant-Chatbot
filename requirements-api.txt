@@ -1,7 +1,7 @@
-# Runtime dependencies for the production API, Mattermost bot and KB refresh
-# (crawler, indexing). Used by the Docker image and the refresh workflow.
-# Install CPU-only torch first to keep images small:
-#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# Runtime dependencies for the production API + Mattermost bot (Docker image).
+# No torch / sentence-transformers here: query embeddings run on the ONNX export
+# of the same model (EMBEDDING_BACKEND=onnx; exported in the Dockerfile's build
+# stage). Crawling and indexing run in GitHub Actions with requirements.txt.
 requests>=2.31
 httpx>=0.27
 beautifulsoup4>=4.12
@@ -11,8 +11,8 @@ ftfy>=6.1
 python-dotenv>=1.0
 numpy>=1.26
 faiss-cpu>=1.8
-sentence-transformers>=3.0
-rank-bm25>=0.2.2
+onnxruntime>=1.18
+tokenizers>=0.19
 pymupdf>=1.24
 groq>=0.9
 fastapi>=0.110

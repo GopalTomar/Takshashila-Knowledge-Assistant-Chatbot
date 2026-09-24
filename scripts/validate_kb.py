@@ -168,11 +168,10 @@ def validate(baseline: Optional[Dict] = None, check_bm25: bool = True) -> dict:
 
     if check_bm25 and chunks:
         try:
-            from rank_bm25 import BM25Okapi
             from src.utils import chunk_search_text
-            from src.vector_store import bm25_tokenize
+            from src.vector_store import CompactBM25, bm25_tokenize
             sample = chunks[: min(len(chunks), 2000)]
-            BM25Okapi([bm25_tokenize(chunk_search_text(c)) or ["_"] for c in sample])
+            CompactBM25([bm25_tokenize(chunk_search_text(c)) or ["_"] for c in sample])   # serving implementation
         except Exception as exc:
             errors.append(f"BM25 index could not be built: {exc}")
 

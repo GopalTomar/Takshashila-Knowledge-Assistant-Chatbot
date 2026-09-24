@@ -1,5 +1,22 @@
 # Operations runbook
 
+Production: **GitHub Pages** (frontend) → **Render Free** (FastAPI + RAG +
+Mattermost `/mattermost/ask`) ← **GitHub Actions** (daily 06:00 IST refresh →
+encrypted `kb-latest` bundle). See DEPLOYMENT.md for setup.
+
+## Render service
+
+* Health: `GET /health` (liveness, Render health check), `GET /ready` (200 once the KB
+  is loaded), `GET /rag/status` (KB version, bundle sync, refresh health).
+* Cold start after the free instance sleeps: ~4 minutes (download + verify + decrypt
+  + load at 0.1 CPU); `/ready` is 503 meanwhile. Optional keep-awake: repository
+  variable `RENDER_KEEPALIVE_URL` (`.github/workflows/keepalive.yml`).
+* Daily KB swap (`KB_LOW_MEMORY=true`): ~40 s of 503 while the new release loads;
+  a failed load restores the previous release.
+* Logs: Render → service → Logs (one JSON line per request; query text is not
+  logged unless `LOG_QUERY_TEXT=true`).
+* Smoke test: `python scripts/smoke_test.py --api https://<service>.onrender.com`.
+
 ## Daily refresh
 
 * Schedule: `KB_REFRESH_TIME` (default `06:00`) in `KB_REFRESH_TIMEZONE`
@@ -59,11 +76,11 @@ Remote (no laptop): `gh workflow run kb-refresh.yml -f force=true [-f full=true]
 
 ## Key rotation
 
-* `KB_BUNDLE_KEY`: generate a new key, set it in GitHub **and** Railway, then run the
+* `KB_BUNDLE_KEY`: generate a new key, set it in GitHub **and** Render, then run the
   refresh workflow (new bundle is encrypted with the new key).
 * `MATTERMOST_SLASH_TOKEN` / `MATTERMOST_ACTION_SECRET`: regenerate in Mattermost,
-  update Railway; existing buttons on old posts stop working (by design).
-* `API_ACCESS_TOKENS`: edit the Railway variable; remove a token to revoke it.
+  update Render; existing buttons on old posts stop working (by design).
+* `API_ACCESS_TOKENS`: edit the Render environment variable; remove a token to revoke it.
 
 ## Observability
 

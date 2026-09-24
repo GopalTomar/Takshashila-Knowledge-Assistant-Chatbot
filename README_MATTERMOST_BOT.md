@@ -624,12 +624,12 @@ Then, inside Mattermost, work through these:
 
 The bot is no longer a separate service. Its routes (`/mattermost/*`, `/voice`) are
 mounted into the production API (`api/main.py`) and deployed as one Docker image on
-Railway — see **DEPLOYMENT.md**. Mattermost therefore calls:
+Render (free web service) — see **DEPLOYMENT.md**. Mattermost therefore calls:
 
 | Mattermost setting | Value |
 |---|---|
-| Slash command Request URL | `https://<service>.up.railway.app/mattermost/ask` |
-| `MATTERMOST_BOT_PUBLIC_URL` (buttons, dialogs, voice) | `https://<service>.up.railway.app` |
+| Slash command Request URL | `https://<service>.onrender.com/mattermost/ask` |
+| `MATTERMOST_BOT_PUBLIC_URL` (buttons, dialogs, voice) | `https://<service>.onrender.com` |
 
 The knowledge base is refreshed daily at 06:00 IST by GitHub Actions and hot-swapped
 into the running API, so `/askkb` answers always come from the latest validated KB.

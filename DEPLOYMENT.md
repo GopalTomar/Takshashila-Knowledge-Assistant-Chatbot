@@ -1,33 +1,56 @@
-# Deployment — laptop-independent production
-
-Three pieces, all hosted:
+# Deployment — laptop-independent production (free tier)
 
 | Piece | Where | What it does |
 |---|---|---|
-| Frontend | **GitHub Pages** (`.github/workflows/deploy-pages.yml`) | Static UI calling the API |
-| API + Mattermost bot | **Railway** (Docker, `railway.json`) | `/api/*`, `/mattermost/*`, health |
-| Daily KB refresh | **GitHub Actions** (`.github/workflows/kb-refresh.yml`) | 06:00 Asia/Kolkata crawl → build → validate → publish encrypted KB |
+| **Frontend** | **GitHub Pages** (`.github/workflows/deploy-pages.yml`) | Static UI → `POST https://<service>.onrender.com/api/query` |
+| **Backend** | **Render Free Web Service** (Docker, `render.yaml`) | FastAPI: `/api/*`, `/health`, `/ready`, `/rag/status`, RAG engine, FAISS + BM25, Groq |
+| **Mattermost** | **Render** `/mattermost/ask` (same service) | `/askkb` slash command on the same RAG engine and security checks |
+| **KB refresh** | **GitHub Actions** (`.github/workflows/kb-refresh.yml`) | 06:00 Asia/Kolkata: crawl website + Commit KB → build → validate → smoke test → publish **encrypted** bundle to the `kb-latest` release |
 
-Why the refresh runs in GitHub Actions rather than inside the API: crawling ~1,400
-URLs and embedding changed chunks is CPU/memory heavy and must never degrade the
-API; Railway volumes cannot be shared between a cron service and the API; Actions
-is free for public repos, independent of the API's health, and emails the repo
-owner when a run fails. The API only downloads verified, validated releases.
+```
+GitHub Pages ──HTTPS /api/query──▶ Render Free (FastAPI + RAG + FAISS/BM25 + Groq, /mattermost/ask)
+                                          ▲  downloads + verifies + decrypts
+GitHub Actions 06:00 IST ──publishes──▶ kb-latest release (encrypted bundle + manifest)
+```
+
+The API never crawls. It downloads the latest encrypted, validated KB bundle that
+GitHub Actions publishes, on startup and every `KB_SYNC_INTERVAL_MINUTES`.
 
 Repository: `GopalTomar/Takshashila-Knowledge-Assistant-Chatbot` (a *project* Pages
-repository). Replace `<owner>/<repo>` below with that name. Public site:
-**https://gopaltomar.github.io/Takshashila-Knowledge-Assistant-Chatbot/** — the
-frontend uses only relative asset paths, so it works under that sub-path.
+repository). Public site: **https://gopaltomar.github.io/Takshashila-Knowledge-Assistant-Chatbot/**
+(the frontend uses only relative asset paths, so it works under that sub-path).
+
+### Render Free constraints and how they are handled
+
+| Constraint | Handling |
+|---|---|
+| **512 MB RAM, 0.1 CPU** | The image runs query embeddings on the ONNX export of the same model (no torch; parity verified at build — the build fails if vectors differ), BM25 is stored as compact arrays (scores identical to rank_bm25), metadata is streamed and de-duplicated. Measured resident memory is in `TEST_REPORT.md`. |
+| **Ephemeral disk** | Nothing permanent is stored on Render. Every start downloads the latest bundle from the `kb-latest` release, verifies size + SHA-256, decrypts (AES-256-GCM, authenticated) and loads it. |
+| **Sleeps after ~15 min idle** | A wake-up takes a few minutes (download + load at 0.1 CPU). `/ready` is 503 meanwhile; the web UI shows "Service starting…"; `/askkb` answers "starting up, ask again in two minutes". Optional: `.github/workflows/keepalive.yml` pings `/health` every 10 min (set variable `RENDER_KEEPALIVE_URL`); one always-on service fits Render's 750 free hours/month. |
+| **Daily new KB** | `KB_LOW_MEMORY=true`: the new release is downloaded, verified and unpacked on disk first; then the old in-memory KB is released and the new one loaded (~1 min of 503 once a day). If loading fails, the previous release is loaded back. A missing/corrupt bundle never replaces the working KB. |
+
+### Where every secret lives
+
+| Place | Values |
+|---|---|
+| **Local only** (`.env`, never committed) | anything, for development |
+| **Render** environment (secrets) | `GROQ_API_KEY`, `KB_BUNDLE_KEY`, `API_ACCESS_TOKENS`, `MATTERMOST_BOT_TOKEN`, `MATTERMOST_SLASH_TOKEN`, `MATTERMOST_ACTION_SECRET` (+ `MATTERMOST_BOT_PUBLIC_URL`) |
+| **GitHub Actions secrets** | `KB_BUNDLE_KEY`, `COMMIT_KB_USERNAME`, `COMMIT_KB_PASSWORD` |
+| **Public** (GitHub Actions *variable*) | `API_BASE_URL=https://<service>.onrender.com` |
+
+The Commit KB credentials are **not** needed on Render (the API never crawls — it
+downloads the encrypted bundle), and the refresh needs neither `GROQ_API_KEY`
+(its smoke test is retrieval-only) nor `HF_TOKEN` (the embedding model is public).
+Nothing secret is ever written to `frontend/`, the Pages site, or the image.
 
 ---
 
 ## 0. One-time preparation (local)
 
 ```bash
-# Generate the bundle encryption key (keep it secret; used by Actions AND Railway)
-python -m src.kb_bundle genkey
-# Generate one or more staff access tokens for internal (Commit KB) answers on the web UI
-python -c "import secrets; print(secrets.token_urlsafe(32))"
+python -m src.kb_bundle genkey                               # KB_BUNDLE_KEY (GitHub secret + Render)
+python -c "import secrets; print(secrets.token_urlsafe(32))" # staff tokens → API_ACCESS_TOKENS
+python -c "import secrets; print(secrets.token_urlsafe(32))" # MATTERMOST_ACTION_SECRET
 ```
 
 ## 1. GitHub repository settings
@@ -36,7 +59,7 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 
 | Secret | Value |
 |---|---|
-| `KB_BUNDLE_KEY` | output of `genkey` |
+| `KB_BUNDLE_KEY` | output of `genkey` (identical value on Render) |
 | `COMMIT_KB_USERNAME` | Commit KB basic-auth username |
 | `COMMIT_KB_PASSWORD` | Commit KB basic-auth password |
 
@@ -44,88 +67,94 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 
 | Variable | Value |
 |---|---|
-| `API_BASE_URL` | `https://<your-service>.up.railway.app` (after step 3) |
-| `KB_REFRESH_TIME` | `06:00` (optional; default) |
-| `KB_REFRESH_TIMEZONE` | `Asia/Kolkata` (optional; default) |
-| `KB_REFRESH_ENABLED` | `true` (optional) |
+| `API_BASE_URL` | `https://<service>.onrender.com` (after step 3) — **required** for the Pages build |
+| `RENDER_KEEPALIVE_URL` | `https://<service>.onrender.com` — optional, keeps the API awake |
+| `KB_REFRESH_TIME` / `KB_REFRESH_TIMEZONE` / `KB_REFRESH_ENABLED` | optional (defaults `06:00` / `Asia/Kolkata` / `true`) |
+| `COMMIT_KB_URL` | optional (default `https://commit.takshashila.org.in/`) |
 
 **Settings → Pages → Build and deployment → Source: GitHub Actions.**
-
-**Settings → Actions → General → Workflow permissions: Read and write** (the refresh
-job uploads release assets).
+Workflow permissions can stay "Read" — each workflow declares the write
+permissions it needs (`contents: write` for release uploads, `pages: write`).
 
 ## 2. First knowledge-base release
 
 Either let Actions bootstrap it (full crawl on GitHub's servers, ~30–60 min):
 
 ```bash
-gh workflow run kb-refresh.yml -f force=true -f full=true
-gh run watch
+gh workflow run kb-refresh.yml -f force=true -f full=true && gh run watch
 ```
 
-or publish the release already built locally (faster):
+or publish a release built locally (the key must equal the `KB_BUNDLE_KEY` secret):
 
 ```bash
-export KB_BUNDLE_KEY=...            # same value as the secret
+export KB_BUNDLE_KEY=...
 python scripts/kb_release.py pack --out-dir dist-kb
 gh release create kb-latest --prerelease --title "Knowledge base (latest, encrypted)" --notes "Encrypted KB bundle"
-gh release upload kb-latest dist-kb/*.tkkb --clobber
-gh release upload kb-latest dist-kb/kb-manifest.json --clobber
+gh release upload kb-latest dist-kb/*.tkkb dist-kb/kb-manifest.json --clobber
 ```
 
 Check: `gh release view kb-latest` lists `kb-manifest.json` and `kb-<version>.tkkb`.
+The bundle is encrypted, so publishing it in a public repository exposes nothing
+without `KB_BUNDLE_KEY`.
 
-## 3. Railway (API + Mattermost)
+## 3. Render (backend + Mattermost)
 
-1. New project → **Deploy from GitHub repo** → this repo (branch `main`). Railway
-   reads `railway.json` and builds the `Dockerfile`.
-2. (Recommended) add a **Volume** mounted at `/app/data` so restarts reuse the
-   downloaded KB instead of re-downloading it.
-3. **Variables** (never commit these):
+**Render Dashboard → New → Blueprint → connect GitHub → select this repository →
+Apply.** `render.yaml` creates the service; Render asks for every `sync: false`
+value (secrets are stored in Render, never in Git).
+
+### Render deployment checklist
+
+| Item | Value |
+|---|---|
+| Service type | Web Service, runtime **Docker**, plan **Free** |
+| Repository / branch | `GopalTomar/Takshashila-Knowledge-Assistant-Chatbot` / `main` |
+| Build | `Dockerfile` (two stages: ONNX export with parity check → torch-free runtime); no build command |
+| Start command | image default: `uvicorn api.main:app --host 0.0.0.0 --port $PORT` (Render injects `PORT`; never set it) |
+| Health check path | `/health` (liveness). Readiness: `/ready` → 200 once the KB is loaded |
+| Auto-deploy | on every commit to `main` (`autoDeployTrigger: commit`) |
+| HTTPS | automatic: `https://<service>.onrender.com` |
+| CORS | `CORS_ALLOW_ORIGINS=https://gopaltomar.github.io` (origin only) |
+| API_BASE_URL | set the GitHub **variable** to `https://<service>.onrender.com` |
+| Mattermost URL | slash command → `https://<service>.onrender.com/mattermost/ask` |
+
+### Environment variables (Render → service → Environment)
+
+Secrets (enter values in Render; never commit):
 
 | Variable | Value |
 |---|---|
-| `GROQ_API_KEY` | Groq key |
-| `GROQ_MODEL` | `openai/gpt-oss-120b` (verified available on your Groq account) |
+| `GROQ_API_KEY` | Groq API key |
 | `KB_BUNDLE_KEY` | same as the GitHub secret |
-| `KB_BUNDLE_MANIFEST_URL` | `https://github.com/<owner>/<repo>/releases/download/kb-latest/kb-manifest.json` |
-| `KB_SYNC_INTERVAL_MINUTES` | `30` |
-| `CORS_ALLOW_ORIGINS` | `https://gopaltomar.github.io` (origin only — browsers never send the path; a full Pages URL is reduced to its origin automatically) |
 | `API_ACCESS_TOKENS` | comma-separated staff tokens (step 0) |
-| `PUBLIC_SOURCES` | `website` |
-| `MATTERMOST_URL` | `https://matter.takshashila.org.in` |
 | `MATTERMOST_BOT_TOKEN` | bot account token |
 | `MATTERMOST_SLASH_TOKEN` | slash command token (step 5) |
-| `MATTERMOST_BOT_PUBLIC_URL` | `https://<your-service>.up.railway.app` |
-| `MATTERMOST_ACTION_SECRET` | random string (signs buttons/dialogs; recommended) |
-| `MATTERMOST_BLOCK_GUESTS` | `true` (default; keeps internal answers away from guests) |
+| `MATTERMOST_ACTION_SECRET` | random string (signs buttons/dialogs) |
+| `MATTERMOST_BOT_PUBLIC_URL` | `https://<service>.onrender.com` |
 
-`PORT` is injected by Railway — do not set it. The health check is `/health`.
+Pre-set by `render.yaml` (non-secret): `KB_BUNDLE_MANIFEST_URL`,
+`KB_SYNC_INTERVAL_MINUTES=30`, `KB_LOW_MEMORY=true`,
+`CORS_ALLOW_ORIGINS=https://gopaltomar.github.io`, `PUBLIC_SOURCES=website`,
+`GROQ_MODEL=openai/gpt-oss-120b`, `MATTERMOST_URL`, `MATTERMOST_BLOCK_GUESTS=true`,
+`MATTERMOST_WARM_RAG_ON_STARTUP=false`, `LOG_QUERY_TEXT=false`.
+Set by the image: `EMBEDDING_BACKEND=onnx`, `EMBEDDING_ONNX_DIR`, `DATA_DIR=/app/data`.
 
-4. **Settings → Networking → Generate Domain.** Verify:
-
-```bash
-curl https://<service>.up.railway.app/health         # liveness (Railway health check)
-curl https://<service>.up.railway.app/ready          # 200 once KB + model are loaded, else 503
-curl https://<service>.up.railway.app/rag/status     # KB version, vectors, bundle sync, refresh health
-curl https://<service>.up.railway.app/api/health     # same status, "ready": true
-curl -X POST https://<service>.up.railway.app/api/query -H 'Content-Type: application/json' \
-     -d '{"query":"What is Takshashila Institution?"}'
-```
-
-Memory: plan for ≥ 2 GB (embedding model + ~33k-vector index + BM25).
+After the first deploy, note the URL and set `MATTERMOST_BOT_PUBLIC_URL` to it.
 
 ## 4. GitHub Pages
 
-Set the `API_BASE_URL` variable (step 1), then push to `main` or run:
+Set the `API_BASE_URL` variable (step 1), then push to `main` or run
+`gh workflow run deploy-pages.yml`. The build fails (by design) if `API_BASE_URL`
+is missing or not `https://`; it refuses to publish anything that looks like a secret.
 
-```bash
-gh workflow run deploy-pages.yml
-```
+**Staff access in the browser.** The site ships no credentials. A staff member may
+type an access token (one of `API_ACCESS_TOKENS`) into the "Staff access" dialog;
+it is kept in `sessionStorage` for that tab only and sent as a Bearer header. CORS
+uses no cookies (`allow_credentials=false`) and only the Pages origin. Without a
+token the API answers from public website content only.
 
-The site is published at `https://gopaltomar.github.io/Takshashila-Knowledge-Assistant-Chatbot/`.
 Local preview: `API_BASE_URL=http://localhost:8000 python frontend/build.py && python -m http.server -d frontend/dist 5500`
-(add `CORS_ALLOW_ORIGINS=http://localhost:5500` to your local `.env`).
+(add `http://localhost:5500` to `CORS_ALLOW_ORIGINS` in your local `.env`).
 
 ## 5. Mattermost
 
@@ -134,94 +163,72 @@ System Console → Integrations → **Slash Commands** → Add:
 | Field | Value |
 |---|---|
 | Command trigger | `askkb` |
-| Request URL | `https://<service>.up.railway.app/mattermost/ask` |
+| Request URL | `https://<service>.onrender.com/mattermost/ask` |
 | Request method | POST |
 | Autocomplete | on; hint `[--me\|--user u\|--channel c\|--group a,b] [short\|detailed\|search] question` |
 
-Copy the generated token into Railway `MATTERMOST_SLASH_TOKEN`. Create a **Bot
+Copy the generated token into Render `MATTERMOST_SLASH_TOKEN`. Create a **Bot
 Account** (System Console → Integrations → Bot Accounts), put its token in
-`MATTERMOST_BOT_TOKEN`, and add the bot to channels it should post in. If your
-Mattermost restricts outgoing connections, allow the Railway domain under
-*System Console → Developer → Allow untrusted internal connections*.
+`MATTERMOST_BOT_TOKEN`, and add the bot to channels where it should post publicly
+or accept `--channel`. Security (unchanged): constant-time slash-token check,
+HMAC-signed and channel-bound buttons/dialogs, requester must be a channel member
+for `--channel`, guest accounts and channels with guests refused
+(`MATTERMOST_BLOCK_GUESTS=true`, fails closed without the bot token).
 
 ## 6. Daily refresh
 
-Nothing to start — the workflow is scheduled. Verify after 06:00 IST:
+Scheduled — nothing to start. The workflow polls every 30 min and
+`scripts/refresh_gate.py` runs the refresh once per day at `KB_REFRESH_TIME` in
+`KB_REFRESH_TIMEZONE` (06:00 Asia/Kolkata; timezone-aware, not UTC). Flow:
+restore last release → incremental crawl (website + Commit KB) → re-embed changed
+chunks only → FAISS + BM25 → validation + smoke test → atomic promotion → encrypted
+bundle upload (bundle first, manifest last). A failed run publishes nothing; the
+previous bundle stays live. Render picks up a new version within
+`KB_SYNC_INTERVAL_MINUTES` (or on its next start).
 
 ```bash
 gh run list --workflow kb-refresh.yml --limit 5
 gh release download kb-latest -p kb-status.json -O - | python -m json.tool
-curl https://<service>.up.railway.app/api/health    # kb.version advances within KB_SYNC_INTERVAL_MINUTES
+curl https://<service>.onrender.com/rag/status     # kb.version advances after the sync
 ```
 
 Manual run: `gh workflow run kb-refresh.yml -f force=true` (add `-f full=true` for a full crawl).
 
-## 7. Local data location (OneDrive)
-
-Generated data (KB releases ~340 MB each, crawl state, logs, reports) lives under
-`DATA_DIR` (default `<repo>/data`). If the repository sits inside OneDrive/Dropbox,
-point `DATA_DIR` at a non-synced folder in your local `.env`:
+## 7. Production smoke test
 
 ```bash
-DATA_DIR=C:/takshashila-data
+python scripts/smoke_test.py --api https://<service>.onrender.com
+SMOKE_STAFF_TOKEN=<one staff token> python scripts/smoke_test.py --api https://<service>.onrender.com
 ```
 
-Curated inputs (the holiday list) are read from `<repo>/data/knowledge_base`
-regardless (`KB_INPUT_DIR` overrides). To keep the current local KB, copy it once —
-nothing is moved automatically:
+Checks `/health`, `/ready` (waits for a cold start), KB version, a public query
+(website-only citations, citation numbers valid, https URLs, scope + KB version),
+anonymous internal query returns no internal sources, invalid token → 401, staff
+query → internal scope, Mattermost wrong slash token / unsigned callback → 403,
+CORS allow (Pages) / deny (other origins). Exit code 0 = all passed.
 
-```powershell
-robocopy data\releases C:\takshashila-data\releases /E
-robocopy data\reports  C:\takshashila-data\reports  /E
-```
-
-Railway and GitHub Actions are unaffected (they use `/app/data` and the runner workspace).
+Then open the Pages site (header: "Service online · KB <version>"), ask a question,
+open a citation; in Mattermost run `/askkb What is the red flag rule?` as staff
+(Commit KB citations) and as a guest (refused).
 
 ## 8. Rollback
 
-* Bad KB published: re-upload a previous bundle + manifest from a successful run's
-  local build, or delete the new assets; the API keeps serving whatever it last
-  activated successfully.
-* Bad code: redeploy the previous commit in Railway (Deployments → Redeploy).
+* **Bad KB published:** delete the new assets from `kb-latest` and re-upload the
+  previous bundle + manifest (or re-run the refresh); Render keeps serving what it
+  last activated and loads the manifest's version on its next sync/start.
+* **Bad code:** Render → service → Events/Deploys → roll back to the previous
+  deploy (or revert the commit on `main`; auto-deploy rebuilds).
 
-## 9. Running the backend on another provider
+## 9. Local data location (OneDrive)
 
-`railway.json` is optional — it only tells Railway to build the `Dockerfile` and
-health-check `/health`. Any container host (Render, Fly.io, Cloud Run, a VM with
-Docker) works the same way:
+Generated data lives under `DATA_DIR` (default `<repo>/data`). If the repository
+sits inside OneDrive/Dropbox, set `DATA_DIR=C:/takshashila-data` in your local
+`.env` (copy `data/releases` + `data/reports` there once; nothing moves
+automatically). Render and GitHub Actions are unaffected.
 
-* build the repository's `Dockerfile` (Linux image; no Windows/OneDrive dependency);
-* start command is the image default: `uvicorn api.main:app --host 0.0.0.0 --port $PORT`
-  (`PORT` defaults to `8000` when the host does not inject one);
-* health check: `GET /health` (liveness); readiness: `GET /ready` (200 once the KB
-  and model are loaded — allow up to ~3 minutes on first start);
-* set the same environment variables as in §3;
-* at least 2 GB RAM, one instance (the in-memory rate limiter and KB are per process).
+## 10. Other container hosts
 
-**Persistent data.** The only runtime data is the downloaded KB under `/app/data`.
-A persistent volume there is *optional*: without it the API re-downloads and
-verifies the latest encrypted bundle on every start (~130 MB). No other state is
-required — the embedding model is baked into the image.
-
-## 10. Production verification checklist
-
-```bash
-API=https://<service>.up.railway.app
-curl -fsS $API/health                        # {"status":"ok",...}
-curl -fsS $API/ready                         # 200 (503 while loading)
-curl -fsS $API/rag/status                    # kb.version, vectors, bundle_sync, refresh health
-curl -fsS -X POST $API/api/query -H 'Content-Type: application/json' \
-     -d '{"query":"What is Takshashila Institution?"}'          # public answer + website citations
-curl -s -o /dev/null -w '%{http_code}\n' -X POST $API/api/query \
-     -H 'Authorization: Bearer wrong' -H 'Content-Type: application/json' -d '{"query":"x"}'   # 401
-curl -s -o /dev/null -w '%{http_code}\n' -X POST $API/mattermost/ask -d 'token=wrong&text=hi'  # 403
-curl -s -D - -o /dev/null -X OPTIONS $API/api/query -H 'Origin: https://gopaltomar.github.io' \
-     -H 'Access-Control-Request-Method: POST' | grep -i access-control-allow-origin
-```
-
-Then open https://gopaltomar.github.io/Takshashila-Knowledge-Assistant-Chatbot/ —
-the header shows "Service online · KB <version>"; ask a question and open a citation.
-In Mattermost run `/askkb What is the red flag rule?` as a staff account (answer
-with Commit KB citations) and as a guest account (refused). After the next 06:00
-IST run: `gh run list --workflow kb-refresh.yml --limit 3` shows success and
-`/rag/status` reports the new `kb.version` within `KB_SYNC_INTERVAL_MINUTES`.
+The image is portable (Linux, no Windows/OneDrive dependency): build the
+`Dockerfile`, set the same environment variables, health-check `/health`, one
+instance. `render.yaml` is only read by Render. On hosts with ≥ 1 GB RAM,
+`KB_LOW_MEMORY=false` gives zero-downtime KB swaps.

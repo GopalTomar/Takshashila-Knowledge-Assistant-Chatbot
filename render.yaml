@@ -1,0 +1,56 @@
+# Render Blueprint — production API + Mattermost bot on a FREE Render web service.
+#
+#   Render Dashboard → New → Blueprint → select this repository → Apply.
+#
+# Secrets are declared with `sync: false`: Render asks for their values when the
+# Blueprint is applied and stores them in the service — they are never in Git.
+# Non-secret settings have fixed values below. See DEPLOYMENT.md.
+services:
+  - type: web
+    name: takshashila-knowledge-assistant
+    runtime: docker
+    plan: free
+    region: singapore                 # closest Render region to India
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health          # liveness; /ready turns 200 once the KB is loaded
+    autoDeployTrigger: commit         # redeploy on every push to main
+    envVars:
+      # ── secrets (entered in the Render dashboard, never committed) ───────────────
+      - key: GROQ_API_KEY
+        sync: false
+      - key: KB_BUNDLE_KEY              # same value as the GitHub secret KB_BUNDLE_KEY
+        sync: false
+      - key: API_ACCESS_TOKENS          # comma-separated staff tokens for internal answers
+        sync: false
+      - key: MATTERMOST_BOT_TOKEN
+        sync: false
+      - key: MATTERMOST_SLASH_TOKEN
+        sync: false
+      - key: MATTERMOST_ACTION_SECRET
+        sync: false
+      # ── deployment URLs (entered once the service URL is known) ─────────────────
+      - key: MATTERMOST_BOT_PUBLIC_URL  # https://<service>.onrender.com
+        sync: false
+      # ── non-secret configuration ────────────────────────────────────────────────
+      - key: KB_BUNDLE_MANIFEST_URL
+        value: https://github.com/GopalTomar/Takshashila-Knowledge-Assistant-Chatbot/releases/download/kb-latest/kb-manifest.json
+      - key: KB_SYNC_INTERVAL_MINUTES
+        value: "30"
+      - key: KB_LOW_MEMORY              # 512 MB instance: never hold two KB states at once
+        value: "true"
+      - key: CORS_ALLOW_ORIGINS
+        value: https://gopaltomar.github.io
+      - key: PUBLIC_SOURCES
+        value: website
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
+      - key: MATTERMOST_URL
+        value: https://matter.takshashila.org.in
+      - key: MATTERMOST_BLOCK_GUESTS
+        value: "true"
+      - key: MATTERMOST_WARM_RAG_ON_STARTUP
+        value: "false"
+      - key: LOG_QUERY_TEXT
+        value: "false"

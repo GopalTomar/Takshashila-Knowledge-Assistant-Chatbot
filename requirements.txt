@@ -1,5 +1,8 @@
 # Full local install: API + refresh (requirements-api.txt) + Streamlit dashboard.
 -r requirements-api.txt
+# Indexing (GitHub Actions refresh, local builds): the full sentence-transformers
+# stack. The API image uses the ONNX export instead (requirements-api.txt).
+sentence-transformers>=3.0
 
 # Streamlit >=1.50 is required for the `width="stretch"` / `width="content"` API.
 streamlit>=1.50,<2.0

@@ -1,5 +1,8 @@
 # Implementation report — production hardening
 
+> **Deployment update (2026-09-24):** the backend now runs on **Render Free** instead of Railway — see `DEPLOYMENT.md`. Railway references below are historical.
+
+
 Branch `production-hardening` (from baseline tag `baseline-pre-audit`). Nothing has
 been pushed. Findings referenced as S/C/R/X/P/D/T are defined in AUDIT_REPORT.md.
 

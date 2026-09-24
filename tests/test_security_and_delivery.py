@@ -21,6 +21,7 @@ def mm(monkeypatch):
     import integrations.mattermost_bot as bot
     monkeypatch.setattr(bot, "_ACTION_SECRET", b"test-secret")
     monkeypatch.setattr(bot, "MATTERMOST_SLASH_TOKEN", "slash-token")
+    monkeypatch.setattr(bot, "READINESS_PROBE", None)      # standalone bot: no hosting API probe
     return bot, TestClient(bot.app)
 
 
@@ -171,6 +172,21 @@ def test_channel_visible_actions_refused_where_guests_are(mm, monkeypatch, actio
     r = c.post("/mattermost/action", json={"context": ctx, "channel_id": "c1", "user_id": "u1"})
     assert "guest" in r.json()["ephemeral_text"]
 
+
+def test_askkb_while_kb_loading_gets_a_wake_up_message(mm, monkeypatch):
+    bot, c = mm
+    _mm_api(monkeypatch)
+    ran = []
+    monkeypatch.setattr(bot, "run_rag_and_reply", lambda **kw: ran.append(kw))
+    monkeypatch.setattr(bot, "READINESS_PROBE", lambda: False)
+    r = c.post("/mattermost/ask", data={"token": "slash-token", "text": "what is the red flag rule",
+                                        "user_id": "u1", "channel_id": "c1"})
+    assert r.status_code == 200 and "starting up" in r.json()["text"] and not ran
+    monkeypatch.setattr(bot, "READINESS_PROBE", lambda: True)
+    c.post("/mattermost/ask", data={"token": "slash-token", "text": "what is the red flag rule",
+                                    "user_id": "u1", "channel_id": "c1"})
+    assert ran
+
 # ── Encrypted KB bundle ────────────────────────────────────────────────────────────
 def _mk_root(tmp_path):
     root = tmp_path / "rel"
@@ -191,6 +207,29 @@ def test_bundle_roundtrip(tmp_path):
     assert (out / "index" / "faiss.index").stat().st_size == 5_000_000
     assert b"documents" not in (tmp_path / "b.tkkb").read_bytes()          # encrypted, not plain tar
 
+
+
+def test_bundle_is_uncompressed_and_older_gzip_bundles_still_unpack(tmp_path):
+    import tarfile as _tar
+    from src import kb_bundle
+    key = kb_bundle.generate_key()
+    root = _mk_root(tmp_path)
+    kb_bundle.pack(root, tmp_path / "new.tkkb", key)
+    plain = tmp_path / "plain.tar"
+    with open(tmp_path / "new.tkkb", "rb") as f, open(plain, "wb") as o:
+        kb_bundle.decrypt_stream(f, o, key)
+    with _tar.open(plain, mode="r:") as t:                         # plain tar (fast to unpack)
+        assert "index/faiss.index" in t.getnames()
+    # a bundle produced by the previous (gzip) format
+    gz = io.BytesIO()
+    with _tar.open(fileobj=gz, mode="w:gz") as t:
+        for m in ("index", "processed", "kb_manifest.json"):
+            t.add(str(root / m), arcname=m)
+    gz.seek(0)
+    with open(tmp_path / "old.tkkb", "wb") as o:
+        kb_bundle.encrypt_stream(gz, o, key)
+    out = kb_bundle.unpack(tmp_path / "old.tkkb", tmp_path / "old_out", key)
+    assert (out / "index" / "faiss.index").stat().st_size == 5_000_000
 
 def test_bundle_wrong_key_tamper_and_truncation_fail(tmp_path):
     from src import kb_bundle

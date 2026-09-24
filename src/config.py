@@ -257,6 +257,13 @@ WEBSITE_MANIFEST_FILE = LOGS_DIR / "website_scrape_manifest.json"
 
 # ── Embeddings ─────────────────────────────────────────────────────────────────
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+# Query-embedding runtime. "sentence-transformers" (default; used for indexing in
+# GitHub Actions and local development) or "onnx": the SAME model weights exported
+# to ONNX (scripts/export_onnx_embedder.py) and run with onnxruntime — no torch in
+# the process, which is what lets the API fit a 512 MB instance (Render Free).
+EMBEDDING_BACKEND = (os.getenv("EMBEDDING_BACKEND") or "sentence-transformers").strip().lower()
+EMBEDDING_ONNX_DIR = os.getenv("EMBEDDING_ONNX_DIR", "")
+EMBEDDING_THREADS = int(os.getenv("EMBEDDING_THREADS", "1"))
 EMBEDDING_DIM   = 384   # bge-small-en-v1.5; update if model changes
 
 # ── Chunking ───────────────────────────────────────────────────────────────────
@@ -376,6 +383,12 @@ KB_BUNDLE_MANIFEST_URL = os.getenv("KB_BUNDLE_MANIFEST_URL", "")
 KB_BUNDLE_KEY          = os.getenv("KB_BUNDLE_KEY", "")          # Fernet key; never commit
 KB_BUNDLE_TOKEN        = os.getenv("KB_BUNDLE_TOKEN", "")        # optional GitHub token
 KB_SYNC_INTERVAL_MINUTES = int(os.getenv("KB_SYNC_INTERVAL_MINUTES", "30"))
+# Low-memory hosts (e.g. Render Free, 512 MB) cannot hold two KB states at once.
+# With KB_LOW_MEMORY=true a new release is fully downloaded, verified and unpacked
+# on disk first; only then is the old in-memory state released and the new one
+# loaded (a ~1 minute 503 window once a day). If loading fails, the previous
+# release — still on disk — is loaded back. Default: zero-downtime hot swap.
+KB_LOW_MEMORY = os.getenv("KB_LOW_MEMORY", "false").lower() in ("1", "true", "yes", "on")
 
 
 # ── Production API (api/main.py) ─────────────────────────────────────────────────

@@ -101,3 +101,31 @@ GitHub Actions execution, GitHub Pages hosting, Railway runtime, real Mattermost
 message delivery via the bot token. Each has a local equivalent that was exercised
 (workflow YAML parsed; gate/refresh/pack/restore scripts run locally; container run
 locally; bot routes exercised through the production API without posting).
+
+## Render Free migration (2026-09-24)
+
+Container runs of the production image under Render Free limits
+(`docker run --memory 512m --memory-swap 512m --cpus 0.1 -e PORT=10000`), with the
+real 33,356-chunk encrypted bundle served from a private Docker network.
+
+| Check | Result |
+|---|---|
+| Memory before changes (torch + sentence-transformers + rank_bm25) | ~1.0–1.1 GB resident → **OOM-killed** at 512 MB |
+| Memory after changes | ~290 MB heap + ~190 MB file-backed (memory-mapped model weights / FAISS, reclaimable); no OOM |
+| Cold start at 0.1 CPU (download → verify → decrypt → load → smoke) | **~4 min** to `/ready` 200 (port bound in < 1 min) |
+| Answer latency at 0.1 CPU | 16–21 s (`answer`), ~10 s (`search`); ~2.5 s on a full CPU |
+| `scripts/smoke_test.py` against the constrained container | **15/15 passed** |
+| Frontend end-to-end (headless Chrome, `?q=` link, cross-origin) | page loads, "Service online · KB <version>", answer + 4 inline citations + source links; API down → "Service unreachable" / clean error |
+| Daily swap (`KB_LOW_MEMORY=true`), new version published | 503 for ~40 s, then new version served; no OOM |
+| Corrupt bundle (checksum mismatch) | rejected; previous KB kept serving (no downtime) |
+
+Equivalence of the memory changes (no retrieval logic changed):
+
+| Change | Proof |
+|---|---|
+| ONNX query embedder (same bge-small weights) | parity vs sentence-transformers: min cosine 0.9999999, max abs diff 1.8e-7 (checked again in every Docker build; build fails otherwise) |
+| CompactBM25 | 210 real-KB queries: scores **bit-identical** to `rank_bm25.BM25Okapi` |
+| Streaming, value-sharing metadata reader | result `==` `json.load` on the real 96 MB file |
+| End-to-end retrieval (20 queries × public/staff scope) | **40/40** result lists identical between the old and new stack |
+
+`pytest -q`: 211 passed, 3 skipped; `ruff check .`: clean; real-index tests 3/3.
